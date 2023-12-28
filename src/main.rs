@@ -1,7 +1,7 @@
+mod camera;
+
 use bevy::{prelude::*, window::WindowMode};
-use bevy_third_person_camera::{
-    ThirdPersonCamera, ThirdPersonCameraPlugin, ThirdPersonCameraTarget, Zoom,
-};
+use camera::{CameraPlugin, Camera};
 
 fn main() {
     App::new()
@@ -14,7 +14,7 @@ fn main() {
                 }),
                 ..default()
             }),
-            ThirdPersonCameraPlugin,
+            CameraPlugin
         ))
         .add_systems(Startup, (setup_camera, setup_light, setup_scene))
         .add_systems(Update, player_movement)
@@ -57,7 +57,6 @@ fn setup_scene(
             ..default()
         },
         Speed { value: 2.5 },
-        ThirdPersonCameraTarget,
     ));
 }
 
@@ -104,10 +103,7 @@ fn player_movement(
 fn setup_camera(mut commands: Commands) {
     commands.spawn((
         Camera3dBundle::default(),
-        ThirdPersonCamera {
-            zoom: Zoom::new(3.0, 15.0),
-            ..default()
-        },
+        Camera::default()
     ));
 }
 
