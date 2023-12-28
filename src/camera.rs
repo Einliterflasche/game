@@ -24,7 +24,7 @@ impl Default for Camera {
     fn default() -> Self {
         Camera {
             distance: 10.0,
-            mouse_sensitivity: 1.0,
+            mouse_sensitivity: 0.5,
         }
     }
 }
@@ -51,44 +51,40 @@ fn orbit_camera(
     let mut mouse_delta = mouse_event_reader.read()
         .fold(Vec2::ZERO, |sum, i| sum + i.delta);
 
+    // make sure the camera can't go inside the player
     if cam_transform.translation == player_transform.translation {
         cam_transform.translation.x += cam.distance;
     }
 
-    // if the mouse moved, rotate the cam around the player
-    if mouse_delta.length() != 0.0 {
-        // normalize mouse movements since they are relative to the 
-        // screen size (in pixels)
-        let window = window_query.get_single().expect("not one window");
-        mouse_delta.x /= window.width();
-        mouse_delta.y /= window.height();
+    // normalize mouse movements since they are relative to the 
+    // screen size (in pixels)
+    let window = window_query.get_single().expect("not one window");
+    mouse_delta.x /= window.width();
+    mouse_delta.y /= window.height();
 
-        // bring in the mouse_sensitivity (changable)
-        // and convert to radians
-        mouse_delta.x *= cam.mouse_sensitivity * PI;
-        mouse_delta.y *= cam.mouse_sensitivity * PI;
+    // bring in the mouse_sensitivity (changable)
+    // and convert to radians
+    mouse_delta.x *= cam.mouse_sensitivity * 2.0 * PI;
+    mouse_delta.y *= cam.mouse_sensitivity * 2.0 * PI;
 
-        // if the mouse goes up rotate the cam down
-        let pitch = Quat::from_rotation_x(-mouse_delta.y);
-        // if the mouse goes right, rotate the cam left
-        let yaw = Quat::from_rotation_y(-mouse_delta.x);
+    // if the mouse goes up rotate the cam down
+    let pitch = Quat::from_rotation_x(-mouse_delta.y);
+    // if the mouse goes right, rotate the cam left
+    let yaw = Quat::from_rotation_y(-mouse_delta.x);
+    
+    // apply yaw
+    cam_transform.rotation = yaw * cam_transform.rotation;
 
-        // rotate the cam around the player
-        let rotation_matrix = Mat3::from_quat(cam_transform.rotation * pitch * yaw);
-        cam_transform.translation = player_transform.translation 
-            + rotation_matrix.mul_vec3(Vec3::new(0.0, 0.0, cam.distance));
-        // cam_transform.rotate_around(player_transform.translation, pitch * yaw);
+    // apply pitch only if the camera doesn't too far
+    if (cam_transform.rotation * pitch * Vec3::Y).y > 0.0 {
+        cam_transform.rotation = cam_transform.rotation * pitch;
     }
 
-    // keep the specified distance to the player
-    let dist = cam_transform.translation - player_transform.translation;
+    // rotate the cam around the player
+    let rotation_matrix = Mat3::from_quat(cam_transform.rotation);
+    cam_transform.translation = player_transform.translation 
+        + rotation_matrix.mul_vec3(Vec3::new(0.0, 0.0, cam.distance));
 
-    if dist.length() != cam.distance {
-        cam_transform.translation = player_transform.translation + dist.normalize() * cam.distance;
-    }
-
-    // rotate the camera to look at the player
-    cam_transform.look_at(player_transform.translation, Vec3::Y);
 }
 
 fn apply_zoom(

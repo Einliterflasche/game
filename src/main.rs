@@ -1,10 +1,11 @@
 mod camera;
 
-use bevy::{prelude::*, window::WindowMode};
+use bevy::{prelude::*, window::WindowMode, winit::WinitSettings};
 use camera::{CameraPlugin, Camera};
 
 fn main() {
     App::new()
+        .insert_resource(WinitSettings::game())
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 // Make fullscreen
@@ -37,7 +38,7 @@ fn setup_scene(
     commands.spawn(PbrBundle {
         mesh: meshes.add(Mesh::from(shape::Plane {
             size: 15.0,
-            subdivisions: 300,
+            subdivisions: 30,
         })),
         material: materials.add(Color::GREEN.into()),
         ..default()
@@ -49,8 +50,8 @@ fn setup_scene(
             mesh: meshes.add(Mesh::from(shape::Cylinder {
                 height: 2.0,
                 radius: 0.6,
-                resolution: 50,
-                segments: 50,
+                resolution: 5,
+                segments: 5,
             })),
             material: materials.add(Color::rgb_u8(124, 144, 255).into()),
             transform: Transform::from_xyz(0.0, 0.5, 0.0),
