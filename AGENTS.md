@@ -12,8 +12,16 @@ This file provides guidance to agents such as Claude Code when working with code
 
 Rust game project using **Bevy 0.18.1** (edition 2024).
 
+## Always read the Bevy source code
+
 The parent folder (the one containing this repo) contains a folder called `bevy`.
 It is a copy of the bevy repo, checked out to the exact version this project is using.
-Whenever there is could be a reason to check the bevy codebase, do it.
+Whenever there is could be any reason to check the bevy codebase, do it.
 Do it using this folder.
 It is trusted.
+
+For example, never claim some function exists without checking it exists before.
+Bevy is a project with frequently updating APIs.
+Whatever you _think_ you know it probably outdated/incorrect.
+
+Always check the examples folder to check for idiomatic patterns that could apply.
