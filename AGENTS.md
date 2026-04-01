@@ -26,3 +26,7 @@ Whatever you _think_ you know it probably outdated/incorrect.
 
 
 **Always check the examples folder to check for idiomatic patterns that could apply.**
+
+## Dependencies
+
+Before suggesting libraries to use with Bevy, check out the current Bevy version this project uses and make sure the suggested dependencies support this exact version.

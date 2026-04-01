@@ -1,0 +1,5 @@
+bevy/
+Cargo.lock
+target/
+target-check/
+
