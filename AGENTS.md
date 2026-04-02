@@ -56,6 +56,8 @@ Files should be ordered in two sections:
  1. Types, trait definitions
  2. impls, trait impls, free standing functions
 
+Within section 2, standard trait impls (Default, Display, Error, etc.) go near the bottom — the main logic and systems are more important.
+
 
 ## Dependencies
 

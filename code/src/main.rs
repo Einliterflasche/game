@@ -6,6 +6,8 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions},
 };
 
+// --- Types ---
+
 #[derive(Component)]
 struct Player;
 
@@ -18,18 +20,7 @@ struct CameraSettings {
     move_speed: f32,
 }
 
-impl Default for CameraSettings {
-    fn default() -> Self {
-        let pitch_limit = FRAC_PI_2 - 0.01;
-        Self {
-            orbit_distance: 10.0,
-            pitch_speed: 0.003,
-            yaw_speed: 0.004,
-            pitch_range: -pitch_limit..pitch_limit,
-            move_speed: 5.0,
-        }
-    }
-}
+// --- Impls & functions ---
 
 fn main() {
     App::new()
@@ -95,25 +86,24 @@ fn player_movement(
     time: Res<Time>,
     settings: Res<CameraSettings>,
 ) {
-    let mut input = Vec3::ZERO;
-    if key_input.pressed(KeyCode::KeyW) {
-        input.z += 1.0;
-    }
-    if key_input.pressed(KeyCode::KeyS) {
-        input.z -= 1.0;
-    }
-    if key_input.pressed(KeyCode::KeyA) {
-        input.x += 1.0;
-    }
-    if key_input.pressed(KeyCode::KeyD) {
-        input.x -= 1.0;
-    }
+    const BINDINGS: [(KeyCode, Vec3); 4] = [
+        (KeyCode::KeyW, Vec3::Z),
+        (KeyCode::KeyS, Vec3::NEG_Z),
+        (KeyCode::KeyA, Vec3::X),
+        (KeyCode::KeyD, Vec3::NEG_X),
+    ];
 
-    if input == Vec3::ZERO {
+    let input: Vec3 = BINDINGS
+        .iter()
+        .filter(|(key, _)| key_input.pressed(*key))
+        .map(|(_, dir)| *dir)
+        .sum();
+
+    let Some(input) = input.try_normalize() else {
         return;
-    }
+    };
 
-    // Move relative to camera's facing direction (projected onto XZ plane)
+    // Move relative to camera facing direction, projected onto XZ plane
     let forward = camera.forward().as_vec3();
     let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
     let right = Vec3::Y.cross(forward).normalize_or_zero();
@@ -133,15 +123,24 @@ fn orbit_camera(
         return;
     }
 
-    let delta = mouse_motion.delta;
-    let delta_pitch = delta.y * settings.pitch_speed;
-    let delta_yaw = delta.x * settings.yaw_speed;
-
-    let (yaw, pitch, _roll) = camera.rotation.to_euler(EulerRot::YXZ);
-    let pitch = (pitch + delta_pitch).clamp(settings.pitch_range.start, settings.pitch_range.end);
-    let yaw = yaw + delta_yaw;
+    let (yaw, pitch, _) = camera.rotation.to_euler(EulerRot::YXZ);
+    let pitch = (pitch + mouse_motion.delta.y * settings.pitch_speed)
+        .clamp(settings.pitch_range.start, settings.pitch_range.end);
+    let yaw = yaw + mouse_motion.delta.x * settings.yaw_speed;
     camera.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
 
-    let target = player.translation;
-    camera.translation = target - camera.forward() * settings.orbit_distance;
+    camera.translation = player.translation - camera.forward() * settings.orbit_distance;
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        let pitch_limit = FRAC_PI_2 - 0.01;
+        Self {
+            orbit_distance: 10.0,
+            pitch_speed: 0.003,
+            yaw_speed: 0.004,
+            pitch_range: -pitch_limit..pitch_limit,
+            move_speed: 5.0,
+        }
+    }
 }
