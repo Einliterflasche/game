@@ -1,6 +1,7 @@
 use std::f32::consts::FRAC_PI_2;
 
 use bevy::{
+    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin},
     input::mouse::AccumulatedMouseMotion,
     prelude::*,
     window::{CursorGrabMode, CursorOptions},
@@ -24,7 +25,19 @@ struct CameraSettings {
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins)
+        .add_plugins((
+            DefaultPlugins,
+            FpsOverlayPlugin {
+                config: FpsOverlayConfig {
+                    text_color: Color::srgb(0.5, 1.0, 0.5),
+                    text_config: TextFont {
+                        font_size: 20.0,
+                        ..default()
+                    },
+                    ..default()
+                },
+            },
+        ))
         .init_resource::<CameraSettings>()
         .add_systems(Startup, setup)
         .add_systems(Update, (grab_cursor, player_movement, orbit_camera).chain())
