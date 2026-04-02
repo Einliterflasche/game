@@ -110,6 +110,9 @@ fn player_movement(
 
     let movement = (forward * input.z + right * input.x).normalize_or_zero();
     player.translation += movement * settings.move_speed * time.delta_secs();
+
+    let target_rot = Transform::IDENTITY.looking_to(movement, Vec3::Y).rotation;
+    player.rotation = player.rotation.slerp(target_rot, 10.0 * time.delta_secs());
 }
 
 fn orbit_camera(

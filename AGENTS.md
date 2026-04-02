@@ -22,6 +22,8 @@ Rust game project using **Bevy 0.18.1** (edition 2024).
 - **Run:** `cd code && cargo run`
 - **Check (fast compile check):** `cd code && cargo check`
 
+After making code changes, always kill existing game processes and relaunch the game so the user can test immediately.
+
 
 ## Always read the Bevy source code
 
