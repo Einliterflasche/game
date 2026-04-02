@@ -1,5 +1,5 @@
-bevy/
-Cargo.lock
-target/
-target-check/
+code/bevy/
+code/Cargo.lock
+code/target/
+code/target-check/
 
