@@ -1,16 +1,28 @@
 use std::f32::consts::FRAC_PI_2;
 
+use avian3d::prelude::*;
 use bevy::{
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin},
     input::mouse::AccumulatedMouseMotion,
     prelude::*,
     window::{CursorGrabMode, CursorOptions},
 };
+use bevy_tnua::builtins::{
+    TnuaBuiltinJump, TnuaBuiltinJumpConfig, TnuaBuiltinWalk, TnuaBuiltinWalkConfig,
+};
+use bevy_tnua::prelude::*;
+use bevy_tnua_avian3d::prelude::*;
 
 // --- Types ---
 
 #[derive(Component)]
 struct Player;
+
+#[derive(TnuaScheme)]
+#[scheme(basis = TnuaBuiltinWalk)]
+enum PlayerActions {
+    Jump(TnuaBuiltinJump),
+}
 
 #[derive(Debug, Resource)]
 struct CameraSettings {
@@ -18,7 +30,6 @@ struct CameraSettings {
     pitch_speed: f32,
     yaw_speed: f32,
     pitch_range: std::ops::Range<f32>,
-    move_speed: f32,
 }
 
 // --- Impls & functions ---
@@ -27,6 +38,9 @@ fn main() {
     App::new()
         .add_plugins((
             DefaultPlugins,
+            PhysicsPlugins::default(),
+            TnuaControllerPlugin::<PlayerActions>::new(FixedUpdate),
+            TnuaAvian3dPlugin::new(FixedUpdate),
             FpsOverlayPlugin {
                 config: FpsOverlayConfig {
                     text_color: Color::srgb(0.5, 1.0, 0.5),
@@ -40,7 +54,7 @@ fn main() {
         ))
         .init_resource::<CameraSettings>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (grab_cursor, player_movement, orbit_camera).chain())
+        .add_systems(Update, (grab_cursor, player_controls, orbit_camera).chain())
         .run();
 }
 
@@ -48,19 +62,39 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut configs: ResMut<Assets<PlayerActionsConfig>>,
 ) {
-    // circular base
+    // ground
     commands.spawn((
-        Mesh3d(meshes.add(Circle::new(4.0))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(50.0, 50.0))),
         MeshMaterial3d(materials.add(Color::WHITE)),
-        Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2)),
+        RigidBody::Static,
+        Collider::half_space(Vec3::Y),
     ));
-    // player cube
+    // player
     commands.spawn((
         Player,
-        Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
+        Mesh3d(meshes.add(Capsule3d {
+            radius: 0.5,
+            half_length: 0.5,
+        })),
         MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
-        Transform::from_xyz(0.0, 0.5, 0.0),
+        Transform::from_xyz(0.0, 2.0, 0.0),
+        RigidBody::Dynamic,
+        Collider::capsule(0.5, 1.0),
+        TnuaController::<PlayerActions>::default(),
+        TnuaConfig::<PlayerActions>(configs.add(PlayerActionsConfig {
+            basis: TnuaBuiltinWalkConfig {
+                float_height: 1.5,
+                ..default()
+            },
+            jump: TnuaBuiltinJumpConfig {
+                height: 4.0,
+                ..default()
+            },
+        })),
+        TnuaAvian3dSensorShape(Collider::cylinder(0.49, 0.0)),
+        LockedAxes::ROTATION_LOCKED,
     ));
     // light
     commands.spawn((
@@ -92,12 +126,10 @@ fn grab_cursor(
     }
 }
 
-fn player_movement(
-    mut player: Single<&mut Transform, With<Player>>,
+fn player_controls(
+    mut controller: Single<&mut TnuaController<PlayerActions>, With<Player>>,
     camera: Single<&Transform, (With<Camera>, Without<Player>)>,
     key_input: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    settings: Res<CameraSettings>,
 ) {
     const BINDINGS: [(KeyCode, Vec3); 4] = [
         (KeyCode::KeyW, Vec3::Z),
@@ -112,20 +144,25 @@ fn player_movement(
         .map(|(_, dir)| *dir)
         .sum();
 
-    let Some(input) = input.try_normalize() else {
-        return;
-    };
-
-    // Move relative to camera facing direction, projected onto XZ plane
+    // Project camera direction onto XZ plane for camera-relative movement
     let forward = camera.forward().as_vec3();
     let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
     let right = Vec3::Y.cross(forward).normalize_or_zero();
 
-    let movement = (forward * input.z + right * input.x).normalize_or_zero();
-    player.translation += movement * settings.move_speed * time.delta_secs();
+    let desired_motion = forward * input.z + right * input.x;
+    let desired_forward = Dir3::new(desired_motion).ok();
 
-    let target_rot = Transform::IDENTITY.looking_to(movement, Vec3::Y).rotation;
-    player.rotation = player.rotation.slerp(target_rot, 10.0 * time.delta_secs());
+    controller.initiate_action_feeding();
+
+    controller.basis = TnuaBuiltinWalk {
+        desired_motion,
+        desired_forward,
+        ..default()
+    };
+
+    if key_input.pressed(KeyCode::Space) {
+        controller.action(PlayerActions::Jump(default()));
+    }
 }
 
 fn orbit_camera(
@@ -156,7 +193,6 @@ impl Default for CameraSettings {
             pitch_speed: 0.003,
             yaw_speed: 0.004,
             pitch_range: -pitch_limit..pitch_limit,
-            move_speed: 5.0,
         }
     }
 }
