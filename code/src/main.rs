@@ -2,9 +2,15 @@ use std::f32::consts::FRAC_PI_2;
 
 use avian3d::prelude::*;
 use bevy::{
+    camera::Exposure,
+    core_pipeline::tonemapping::Tonemapping,
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin},
     input::mouse::AccumulatedMouseMotion,
+    light::{light_consts::lux, AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder},
+    pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium},
+    post_process::bloom::Bloom,
     prelude::*,
+    render::view::{ColorGrading, ColorGradingGlobal},
     window::{CursorGrabMode, CursorOptions},
 };
 use bevy_tnua::builtins::{
@@ -14,6 +20,10 @@ use bevy_tnua::prelude::*;
 use bevy_tnua_avian3d::prelude::*;
 
 // --- Types ---
+
+const PLAYER_SPAWN: Vec3 = Vec3::new(0.0, 2.0, 0.0);
+const PLAYER_RADIUS: f32 = 0.25;
+const PLAYER_CYLINDER_HEIGHT: f32 = 1.0;
 
 #[derive(Component)]
 struct Player;
@@ -52,9 +62,10 @@ fn main() {
                 },
             },
         ))
+        .insert_resource(GlobalAmbientLight::NONE)
         .init_resource::<CameraSettings>()
-        .add_systems(Startup, setup)
-        .add_systems(Update, (grab_cursor, player_controls, orbit_camera).chain())
+        .add_systems(Startup, (setup, lock_cursor))
+        .add_systems(Update, (respawn_player, player_controls, orbit_camera).chain())
         .run();
 }
 
@@ -63,10 +74,11 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut configs: ResMut<Assets<PlayerActionsConfig>>,
+    mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
     // ground
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(50.0, 50.0))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(1000.0, 1000.0))),
         MeshMaterial3d(materials.add(Color::WHITE)),
         RigidBody::Static,
         Collider::half_space(Vec3::Y),
@@ -75,17 +87,19 @@ fn setup(
     commands.spawn((
         Player,
         Mesh3d(meshes.add(Capsule3d {
-            radius: 0.5,
-            half_length: 0.5,
+            radius: PLAYER_RADIUS,
+            half_length: PLAYER_CYLINDER_HEIGHT / 2.0,
         })),
-        MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
-        Transform::from_xyz(0.0, 2.0, 0.0),
+        MeshMaterial3d(materials.add(Color::srgb(0.5, 0.5, 0.5))),
+        Transform::from_translation(PLAYER_SPAWN),
         RigidBody::Dynamic,
-        Collider::capsule(0.5, 1.0),
+        Collider::capsule(PLAYER_RADIUS, PLAYER_CYLINDER_HEIGHT),
         TnuaController::<PlayerActions>::default(),
         TnuaConfig::<PlayerActions>(configs.add(PlayerActionsConfig {
             basis: TnuaBuiltinWalkConfig {
-                float_height: 1.5,
+                // Center of mass height above ground. Half the total capsule height
+                // plus a small margin for the spring system.
+                float_height: (PLAYER_CYLINDER_HEIGHT / 2.0 + PLAYER_RADIUS) + 0.01,
                 ..default()
             },
             jump: TnuaBuiltinJumpConfig {
@@ -93,36 +107,60 @@ fn setup(
                 ..default()
             },
         })),
-        TnuaAvian3dSensorShape(Collider::cylinder(0.49, 0.0)),
+        TnuaAvian3dSensorShape(Collider::cylinder(PLAYER_RADIUS - 0.01, 0.0)),
         LockedAxes::ROTATION_LOCKED,
     ));
-    // light
+    // sun
     commands.spawn((
-        PointLight {
+        DirectionalLight {
+            color: Color::srgb(1.0, 0.98, 0.94),
+            illuminance: lux::RAW_SUNLIGHT,
             shadows_enabled: true,
             ..default()
         },
-        Transform::from_xyz(4.0, 8.0, 4.0),
+        Transform::IDENTITY.looking_to(Vec3::new(1.0, -0.3, 0.5), Vec3::Y),
+        CascadeShadowConfigBuilder {
+            first_cascade_far_bound: 5.0,
+            maximum_distance: 50.0,
+            ..default()
+        }
+        .build(),
     ));
     // camera
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 5.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Atmosphere::earthlike(scattering_mediums.add(ScatteringMedium::default())),
+        AtmosphereSettings::default(),
+        AtmosphereEnvironmentMapLight::default(),
+        Exposure { ev100: 13.0 },
+        Tonemapping::AcesFitted,
+        Bloom::NATURAL,
+        ColorGrading {
+            global: ColorGradingGlobal {
+                temperature: 0.03,
+                post_saturation: 1.1,
+                ..default()
+            },
+            ..default()
+        },
     ));
 }
 
-fn grab_cursor(
-    mut cursor: Single<&mut CursorOptions, With<Window>>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
+fn lock_cursor(mut cursor: Single<&mut CursorOptions, With<Window>>) {
+    cursor.grab_mode = CursorGrabMode::Locked;
+    cursor.visible = false;
+}
+
+fn respawn_player(
+    mut player: Single<(&mut Transform, &mut LinearVelocity, &mut AngularVelocity), With<Player>>,
     key_input: Res<ButtonInput<KeyCode>>,
 ) {
-    if mouse_buttons.just_pressed(MouseButton::Left) {
-        cursor.grab_mode = CursorGrabMode::Locked;
-        cursor.visible = false;
-    }
     if key_input.just_pressed(KeyCode::Escape) {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
+        let (transform, linear_vel, angular_vel) = &mut *player;
+        transform.translation = PLAYER_SPAWN;
+        linear_vel.0 = Vec3::ZERO;
+        angular_vel.0 = Vec3::ZERO;
     }
 }
 
@@ -170,12 +208,7 @@ fn orbit_camera(
     player: Single<&Transform, (With<Player>, Without<Camera>)>,
     mouse_motion: Res<AccumulatedMouseMotion>,
     settings: Res<CameraSettings>,
-    cursor: Single<&CursorOptions, With<Window>>,
 ) {
-    if matches!(cursor.grab_mode, CursorGrabMode::None) {
-        return;
-    }
-
     let (yaw, pitch, _) = camera.rotation.to_euler(EulerRot::YXZ);
     let pitch = (pitch + mouse_motion.delta.y * settings.pitch_speed)
         .clamp(settings.pitch_range.start, settings.pitch_range.end);
