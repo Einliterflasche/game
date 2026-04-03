@@ -97,19 +97,37 @@ fn setup(
         TnuaController::<PlayerActions>::default(),
         TnuaConfig::<PlayerActions>(configs.add(PlayerActionsConfig {
             basis: TnuaBuiltinWalkConfig {
+                speed: 1.4,
                 // Center of mass height above ground. Half the total capsule height
                 // plus a small margin for the spring system.
                 float_height: (PLAYER_CYLINDER_HEIGHT / 2.0 + PLAYER_RADIUS) + 0.01,
                 ..default()
             },
             jump: TnuaBuiltinJumpConfig {
-                height: 4.0,
+                height: 1.5,
                 ..default()
             },
         })),
         TnuaAvian3dSensorShape(Collider::cylinder(PLAYER_RADIUS - 0.01, 0.0)),
         LockedAxes::ROTATION_LOCKED,
     ));
+    // reference cubes
+    let cube_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
+    for (size, pos) in [
+        (1.0, Vec3::new(3.0, 0.5, -3.0)),
+        (2.0, Vec3::new(-4.0, 1.0, -5.0)),
+        (3.0, Vec3::new(6.0, 1.5, -6.0)),
+        (1.0, Vec3::new(-2.0, 0.5, 2.0)),
+        (2.0, Vec3::new(5.0, 1.0, 3.0)),
+    ] {
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(size, size, size))),
+            MeshMaterial3d(cube_material.clone()),
+            Transform::from_translation(pos),
+            RigidBody::Static,
+            Collider::cuboid(size, size, size),
+        ));
+    }
     // sun
     commands.spawn((
         DirectionalLight {
@@ -180,14 +198,16 @@ fn player_controls(
         .iter()
         .filter(|(key, _)| key_input.pressed(*key))
         .map(|(_, dir)| *dir)
-        .sum();
+        .sum::<Vec3>()
+        .normalize_or_zero();
 
     // Project camera direction onto XZ plane for camera-relative movement
     let forward = camera.forward().as_vec3();
     let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
     let right = Vec3::Y.cross(forward).normalize_or_zero();
 
-    let desired_motion = forward * input.z + right * input.x;
+    let sprint = if key_input.pressed(KeyCode::ShiftLeft) { 3.0 } else { 1.0 };
+    let desired_motion = (forward * input.z + right * input.x) * sprint;
     let desired_forward = Dir3::new(desired_motion).ok();
 
     controller.initiate_action_feeding();
@@ -210,9 +230,9 @@ fn orbit_camera(
     settings: Res<CameraSettings>,
 ) {
     let (yaw, pitch, _) = camera.rotation.to_euler(EulerRot::YXZ);
-    let pitch = (pitch + mouse_motion.delta.y * settings.pitch_speed)
+    let pitch = (pitch - mouse_motion.delta.y * settings.pitch_speed)
         .clamp(settings.pitch_range.start, settings.pitch_range.end);
-    let yaw = yaw + mouse_motion.delta.x * settings.yaw_speed;
+    let yaw = yaw - mouse_motion.delta.x * settings.yaw_speed;
     camera.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
 
     camera.translation = player.translation - camera.forward() * settings.orbit_distance;
