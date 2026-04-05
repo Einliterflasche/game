@@ -10,7 +10,8 @@ use bevy::{
     pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium},
     post_process::bloom::Bloom,
     prelude::*,
-    render::view::{ColorGrading, ColorGradingGlobal},
+    render::{render_resource::AsBindGroup, view::{ColorGrading, ColorGradingGlobal}},
+    shader::ShaderRef,
     window::{CursorGrabMode, CursorOptions},
 };
 use bevy_tnua::builtins::{
@@ -26,7 +27,7 @@ const PLAYER_RADIUS: f32 = 0.25;
 const PLAYER_CYLINDER_HEIGHT: f32 = 1.0;
 const WAND_TIP_OFFSET: Vec3 = Vec3::new(0.25, -0.1, -0.4);
 
-const SPELL_SPEED: f32 = 20.0;
+const SPELL_SPEED: f32 = 12.0;
 const SPELL_LIFETIME: f32 = 3.0;
 const SPELL_RADIUS: f32 = 0.1;
 
@@ -52,6 +53,14 @@ struct CameraSettings {
     pitch_range: std::ops::Range<f32>,
 }
 
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+struct FlameOrbMaterial {
+    #[uniform(0)]
+    core_color: LinearRgba,
+    #[uniform(1)]
+    flame_speed: f32,
+}
+
 // --- Impls & functions ---
 
 fn main() {
@@ -71,6 +80,7 @@ fn main() {
                     ..default()
                 },
             },
+            MaterialPlugin::<FlameOrbMaterial>::default(),
         ))
         .insert_resource(GlobalAmbientLight::NONE)
         .init_resource::<CameraSettings>()
@@ -243,7 +253,7 @@ fn player_controls(
 fn cast_spell(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<FlameOrbMaterial>>,
     player: Single<&Transform, With<Player>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
 ) {
@@ -257,9 +267,9 @@ fn cast_spell(
     commands.spawn((
         Spell { timer: Timer::from_seconds(SPELL_LIFETIME, TimerMode::Once) },
         Mesh3d(meshes.add(Sphere { radius: SPELL_RADIUS })),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            emissive: LinearRgba::new(10.0, 5.0, 1.0, 1.0),
-            ..default()
+        MeshMaterial3d(materials.add(FlameOrbMaterial {
+            core_color: LinearRgba::new(10.0, 6.0, 1.5, 1.0),
+            flame_speed: 1.0,
         })),
         Transform::from_translation(spawn_pos),
         RigidBody::Dynamic,
@@ -300,6 +310,20 @@ fn orbit_camera(
     camera.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
 
     camera.translation = player.translation - camera.forward() * settings.orbit_distance;
+}
+
+impl Material for FlameOrbMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/flame_orb.wgsl".into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        "shaders/flame_orb.wgsl".into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
 }
 
 impl Default for CameraSettings {
