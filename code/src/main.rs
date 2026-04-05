@@ -25,7 +25,7 @@ use bevy_tnua_avian3d::prelude::*;
 const PLAYER_SPAWN: Vec3 = Vec3::new(0.0, 2.0, 0.0);
 const PLAYER_RADIUS: f32 = 0.25;
 const PLAYER_CYLINDER_HEIGHT: f32 = 1.0;
-const WAND_TIP_OFFSET: Vec3 = Vec3::new(0.25, -0.1, -0.4);
+const WAND_TIP_OFFSET: Vec3 = Vec3::new(0.25, -0.15, -0.7);
 
 const SPELL_SPEED: f32 = 12.0;
 const SPELL_LIFETIME: f32 = 3.0;
@@ -47,7 +47,6 @@ enum PlayerActions {
 
 #[derive(Debug, Resource)]
 struct CameraSettings {
-    orbit_distance: f32,
     pitch_speed: f32,
     yaw_speed: f32,
     pitch_range: std::ops::Range<f32>,
@@ -85,7 +84,7 @@ fn main() {
         .insert_resource(GlobalAmbientLight::NONE)
         .init_resource::<CameraSettings>()
         .add_systems(Startup, (setup, lock_cursor))
-        .add_systems(Update, (respawn_player, player_controls, cast_spell, orbit_camera).chain())
+        .add_systems(Update, (respawn_player, first_person_camera, player_controls, cast_spell).chain())
         .add_systems(Update, despawn_expired_spells)
         .run();
 }
@@ -131,12 +130,6 @@ fn setup(
         })),
         TnuaAvian3dSensorShape(Collider::cylinder(PLAYER_RADIUS - 0.01, 0.0)),
         LockedAxes::new().lock_rotation_x().lock_rotation_z(),
-    ))
-    .with_child((
-        Mesh3d(meshes.add(Cylinder { radius: 0.015, half_height: 0.2 })),
-        MeshMaterial3d(materials.add(Color::srgb(0.4, 0.25, 0.1))),
-        Transform::from_xyz(0.25, -0.1, -0.2)
-            .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
     ));
     // reference cubes
     let cube_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
@@ -174,7 +167,7 @@ fn setup(
     // camera
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 5.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_translation(PLAYER_SPAWN + Vec3::Y * 0.65),
         Atmosphere::earthlike(scattering_mediums.add(ScatteringMedium::default())),
         AtmosphereSettings::default(),
         AtmosphereEnvironmentMapLight::default(),
@@ -189,6 +182,12 @@ fn setup(
             },
             ..default()
         },
+    ))
+    .with_child((
+        Mesh3d(meshes.add(Cylinder { radius: 0.015, half_height: 0.2 })),
+        MeshMaterial3d(materials.add(Color::srgb(0.4, 0.25, 0.1))),
+        Transform::from_xyz(0.25, -0.15, -0.4)
+            .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
     ));
 }
 
@@ -254,15 +253,15 @@ fn cast_spell(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FlameOrbMaterial>>,
-    player: Single<&Transform, With<Player>>,
+    camera: Single<&Transform, With<Camera>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
 ) {
     if !mouse_buttons.just_pressed(MouseButton::Left) {
         return;
     }
 
-    let spawn_pos = player.transform_point(WAND_TIP_OFFSET);
-    let direction = player.forward().as_vec3();
+    let spawn_pos = camera.transform_point(WAND_TIP_OFFSET);
+    let direction = camera.forward().as_vec3();
 
     commands.spawn((
         Spell { timer: Timer::from_seconds(SPELL_LIFETIME, TimerMode::Once) },
@@ -297,7 +296,7 @@ fn despawn_expired_spells(
     }
 }
 
-fn orbit_camera(
+fn first_person_camera(
     mut camera: Single<&mut Transform, With<Camera>>,
     player: Single<&Transform, (With<Player>, Without<Camera>)>,
     mouse_motion: Res<AccumulatedMouseMotion>,
@@ -309,7 +308,8 @@ fn orbit_camera(
     let yaw = yaw - mouse_motion.delta.x * settings.yaw_speed;
     camera.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
 
-    camera.translation = player.translation - camera.forward() * settings.orbit_distance;
+    let eye_offset = PLAYER_CYLINDER_HEIGHT / 2.0 + PLAYER_RADIUS - 0.1;
+    camera.translation = player.translation + Vec3::Y * eye_offset;
 }
 
 impl Material for FlameOrbMaterial {
@@ -330,7 +330,6 @@ impl Default for CameraSettings {
     fn default() -> Self {
         let pitch_limit = FRAC_PI_2 - 0.01;
         Self {
-            orbit_distance: 10.0,
             pitch_speed: 0.003,
             yaw_speed: 0.004,
             pitch_range: -pitch_limit..pitch_limit,
