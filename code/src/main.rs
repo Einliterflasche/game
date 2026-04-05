@@ -109,7 +109,13 @@ fn setup(
             },
         })),
         TnuaAvian3dSensorShape(Collider::cylinder(PLAYER_RADIUS - 0.01, 0.0)),
-        LockedAxes::ROTATION_LOCKED,
+        LockedAxes::new().lock_rotation_x().lock_rotation_z(),
+    ))
+    .with_child((
+        Mesh3d(meshes.add(Cylinder { radius: 0.015, half_height: 0.2 })),
+        MeshMaterial3d(materials.add(Color::srgb(0.4, 0.25, 0.1))),
+        Transform::from_xyz(0.25, -0.1, -0.2)
+            .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
     ));
     // reference cubes
     let cube_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
