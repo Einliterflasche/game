@@ -24,9 +24,19 @@ use bevy_tnua_avian3d::prelude::*;
 const PLAYER_SPAWN: Vec3 = Vec3::new(0.0, 2.0, 0.0);
 const PLAYER_RADIUS: f32 = 0.25;
 const PLAYER_CYLINDER_HEIGHT: f32 = 1.0;
+const WAND_TIP_OFFSET: Vec3 = Vec3::new(0.25, -0.1, -0.4);
+
+const SPELL_SPEED: f32 = 20.0;
+const SPELL_LIFETIME: f32 = 3.0;
+const SPELL_RADIUS: f32 = 0.1;
 
 #[derive(Component)]
 struct Player;
+
+#[derive(Component)]
+struct Spell {
+    timer: Timer,
+}
 
 #[derive(TnuaScheme)]
 #[scheme(basis = TnuaBuiltinWalk)]
@@ -65,7 +75,8 @@ fn main() {
         .insert_resource(GlobalAmbientLight::NONE)
         .init_resource::<CameraSettings>()
         .add_systems(Startup, (setup, lock_cursor))
-        .add_systems(Update, (respawn_player, player_controls, orbit_camera).chain())
+        .add_systems(Update, (respawn_player, player_controls, cast_spell, orbit_camera).chain())
+        .add_systems(Update, despawn_expired_spells)
         .run();
 }
 
@@ -226,6 +237,53 @@ fn player_controls(
 
     if key_input.pressed(KeyCode::Space) {
         controller.action(PlayerActions::Jump(default()));
+    }
+}
+
+fn cast_spell(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    player: Single<&Transform, With<Player>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+) {
+    if !mouse_buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let spawn_pos = player.transform_point(WAND_TIP_OFFSET);
+    let direction = player.forward().as_vec3();
+
+    commands.spawn((
+        Spell { timer: Timer::from_seconds(SPELL_LIFETIME, TimerMode::Once) },
+        Mesh3d(meshes.add(Sphere { radius: SPELL_RADIUS })),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            emissive: LinearRgba::new(10.0, 5.0, 1.0, 1.0),
+            ..default()
+        })),
+        Transform::from_translation(spawn_pos),
+        RigidBody::Dynamic,
+        Collider::sphere(SPELL_RADIUS),
+        Sensor,
+        CollidingEntities::default(),
+        LinearVelocity(direction * SPELL_SPEED),
+        GravityScale(0.0),
+    ));
+}
+
+fn despawn_expired_spells(
+    mut commands: Commands,
+    mut spells: Query<(Entity, &mut Spell, &CollidingEntities)>,
+    player: Single<Entity, With<Player>>,
+    time: Res<Time>,
+) {
+    let player = *player;
+    for (entity, mut spell, colliding) in &mut spells {
+        spell.timer.tick(time.delta());
+        let hit_something = colliding.iter().any(|&e| e != player);
+        if spell.timer.is_finished() || hit_something {
+            commands.entity(entity).despawn();
+        }
     }
 }
 
