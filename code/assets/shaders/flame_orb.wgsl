@@ -55,10 +55,15 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let world_pos = (world_from_local * vec4(vertex.position, 1.0)).xyz;
     let t = globals.time * flame_speed;
 
-    // Displace vertices along normal using noise — breaks the sphere silhouette
-    var noise_pos = world_pos * 5.0;
-    noise_pos.y -= t * 3.0;
-    let displacement = fbm(noise_pos) * 2.0 - 0.8;
+    // Domain distortion — FBM feeds into FBM for organic swirling
+    var p = world_pos * 5.0;
+    p.y -= t * 2.0;
+    let q = vec3(
+        fbm(p + vec3(0.0, 0.0, t * 0.5)),
+        fbm(p + vec3(0.3, 1.3, t * 0.5)),
+        t * 0.5
+    );
+    let displacement = fbm(p + q * 0.5) * 2.0 - 0.8;
     let displaced_pos = vertex.position + vertex.normal * displacement * 0.08;
 
     out.world_position = mesh_functions::mesh_position_local_to_world(
@@ -91,27 +96,22 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let facing = saturate(dot(view_dir, normal));
     let rim = 1.0 - facing;
 
-    // Primary flame noise — rises upward, large scale
-    var noise_pos = world_pos * 6.0;
-    noise_pos.y -= t * 3.0;
-    let n1 = fbm(noise_pos);
-
-    // Secondary turbulence — faster, different direction for chaotic look
-    var turb_pos = world_pos * 10.0;
-    turb_pos.y -= t * 5.0;
-    turb_pos.x += t * 1.5;
-    let n2 = fbm(turb_pos);
-
-    // Combine: noise defines an irregular boundary
-    let noise_val = n1 * 0.6 + n2 * 0.4;
-    let noise_boundary = noise_val * 2.0 - 0.6;
-    let flame = saturate(noise_boundary - rim * 0.25);
+    // Domain distortion — FBM warps the input of another FBM for organic fire
+    var p = world_pos * 6.0;
+    p.y -= t * 2.0;
+    let q = vec3(
+        fbm(p + vec3(0.0, 0.0, t * 0.5)),
+        fbm(p + vec3(0.3, 1.3, t * 0.5)),
+        t * 0.5
+    );
+    let fire_val = fbm(p + q * 0.5);
+    let flame = saturate(fire_val * 2.0 - 0.6 - rim * 0.25);
 
     // Golden color ramp
     let bright_gold = vec3(1.0, 0.95, 0.7);
     let gold        = vec3(1.0, 0.7, 0.15);
     let deep_gold   = vec3(0.9, 0.45, 0.03);
-    let ember       = vec3(0.5, 0.15, 0.0);
+    let ember       = vec3(0.7, 0.08, 0.0);
 
     let c1 = mix(ember, deep_gold, smoothstep(0.0, 0.3, flame));
     let c2 = mix(c1, gold, smoothstep(0.3, 0.6, flame));
