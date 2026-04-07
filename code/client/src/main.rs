@@ -12,7 +12,10 @@ use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin},
     input::mouse::AccumulatedMouseMotion,
-    light::{AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder, light_consts::lux},
+    light::{
+        AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder, DirectionalLightShadowMap,
+        light_consts::lux,
+    },
     pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium},
     post_process::bloom::Bloom,
     prelude::*,
@@ -138,6 +141,9 @@ fn main() {
             PlayerPhysicsPlugin,
         ))
         .insert_resource(GlobalAmbientLight::NONE)
+        // 1024² is plenty for a 50 m shadow range and ~quarters memory + bandwidth
+        // versus the 2048² default.
+        .insert_resource(DirectionalLightShadowMap { size: 1024 })
         // Match the server's tick rate so `send_input` fires at the same cadence
         // the server consumes inputs.
         .insert_resource(Time::<Fixed>::from_hz(64.0))
@@ -215,7 +221,8 @@ fn setup_world(
         },
         Transform::IDENTITY.looking_to(Vec3::new(1.0, -0.3, 0.5), Vec3::Y),
         CascadeShadowConfigBuilder {
-            first_cascade_far_bound: 5.0,
+            num_cascades: 2,
+            first_cascade_far_bound: 8.0,
             maximum_distance: 50.0,
             ..default()
         }
@@ -226,9 +233,28 @@ fn setup_world(
         .spawn((
             Camera3d::default(),
             Transform::from_translation(Vec3::Y * 2.0),
+            // Bloom + tonemapping already smooth the image; MSAA's per-edge
+            // fragment-shader cost isn't worth it on the current pipeline.
+            Msaa::Off,
             Atmosphere::earthlike(scattering_mediums.add(ScatteringMedium::default())),
-            AtmosphereSettings::default(),
-            AtmosphereEnvironmentMapLight::default(),
+            // Sun is static, so the LUTs barely change frame-to-frame. Halve every
+            // axis vs the defaults — still imperceptible after the env-map blur.
+            AtmosphereSettings {
+                transmittance_lut_size: UVec2::new(128, 64),
+                transmittance_lut_samples: 20,
+                multiscattering_lut_dirs: 32,
+                multiscattering_lut_samples: 10,
+                sky_view_lut_size: UVec2::new(192, 108),
+                sky_view_lut_samples: 8,
+                aerial_view_lut_samples: 6,
+                ..default()
+            },
+            // 128² cubemap is more than enough for IBL — the env map gets
+            // heavily blurred when sampled. Default 512² wastes ~16× the work.
+            AtmosphereEnvironmentMapLight {
+                size: UVec2::new(128, 128),
+                ..default()
+            },
             Exposure { ev100: 13.0 },
             Tonemapping::AcesFitted,
             Bloom::NATURAL,
@@ -576,7 +602,10 @@ impl Material for FlameOrbMaterial {
     }
 
     fn alpha_mode(&self) -> AlphaMode {
-        AlphaMode::Blend
+        // Mask gives us depth-write + early-Z so the orb stops paying full
+        // overdraw cost on every overlapping fragment. The shader does its
+        // own discard at this threshold.
+        AlphaMode::Mask(0.5)
     }
 }
 

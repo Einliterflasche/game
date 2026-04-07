@@ -39,7 +39,8 @@ fn fbm(p: vec3<f32>) -> f32 {
     var val = 0.0;
     var amp = 0.5;
     var pos = p;
-    for (var i = 0; i < 4; i++) {
+    // 3 octaves: visually identical to 4 at the orb's screen size, ~25% cheaper.
+    for (var i = 0; i < 3; i++) {
         val += amp * value_noise(pos);
         pos *= 2.2;
         amp *= 0.5;
@@ -96,14 +97,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let facing = saturate(dot(view_dir, normal));
     let rim = 1.0 - facing;
 
-    // Domain distortion — FBM warps the input of another FBM for organic fire
+    // Domain distortion — single FBM warp re-used on both axes. Used to be two
+    // separate fbm calls; visually almost identical and one fewer fbm per pixel.
     var p = world_pos * 6.0;
     p.y -= t * 2.0;
-    let q = vec3(
-        fbm(p + vec3(0.0, 0.0, t * 0.5)),
-        fbm(p + vec3(0.3, 1.3, t * 0.5)),
-        t * 0.5
-    );
+    let warp = fbm(p + vec3(0.0, 0.0, t * 0.5));
+    let q = vec3(warp, warp * 0.7 + 0.3, t * 0.5);
     let fire_val = fbm(p + q * 0.5);
     let flame = saturate(fire_val * 2.0 - 0.6 - rim * 0.25);
 
@@ -119,8 +118,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let hdr_color = color * core_color.rgb;
 
-    // Ragged alpha — sharp cutoff for wispy edges
+    // Ragged alpha — sharp cutoff for wispy edges. AlphaMode::Mask(0.5) means
+    // the pipeline expects an opaque output, so we discard below the threshold
+    // ourselves and emit alpha = 1.0 above it.
     let alpha = smoothstep(0.0, 0.08, flame);
+    if (alpha < 0.5) {
+        discard;
+    }
 
-    return vec4(hdr_color, alpha);
+    return vec4(hdr_color, 1.0);
 }
