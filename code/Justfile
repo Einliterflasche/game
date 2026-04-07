@@ -1,0 +1,10 @@
+default:
+    @just --list
+
+# Run the headless game server (binds UDP :5000).
+server:
+    cargo run -p server
+
+# Run the game client. Optionally pass `host:port` (default 127.0.0.1:5000).
+client *ARGS:
+    cargo run -p client -- {{ARGS}}

@@ -1,0 +1,17 @@
+[package]
+name = "server"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+shared = { path = "../shared" }
+bevy = { version = "0.18.1", default-features = false, features = [
+  "std",
+  "bevy_log",
+  "bevy_state",
+  "bevy_asset",
+  "serialize",
+] }
+bevy_replicon.workspace = true
+bevy_replicon_renet.workspace = true
+serde.workspace = true

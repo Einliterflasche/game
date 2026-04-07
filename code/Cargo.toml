@@ -1,17 +1,30 @@
-[package]
-name = "game"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = ["shared", "client", "server"]
+exclude = ["bevy", "src"]
 
-[dependencies]
-avian3d = "0.6"
-bevy = { version = "0.18.1", features = ["dynamic_linking", "bevy_dev_tools"] }
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Avian with a minimal feature set: no debug-plugin (gizmos/render), no
+# collider-from-mesh (bevy_mesh), no bevy_scene, no bevy_picking. This lets
+# the headless server run without bevy_render / MeshPlugin / ScenePlugin.
+avian3d = { version = "0.6", default-features = false, features = [
+  "3d",
+  "f32",
+  "parry-f32",
+  "parallel",
+] }
 bevy-tnua = "0.31"
 bevy-tnua-avian3d = "0.11"
+bevy_replicon = "0.39"
+bevy_replicon_renet = { version = "0.15", features = ["client", "server", "renet_netcode"] }
+serde = { version = "1", features = ["derive"] }
 
 [profile.dev]
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
-
