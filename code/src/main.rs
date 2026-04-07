@@ -45,6 +45,27 @@ enum PlayerActions {
     Jump(TnuaBuiltinJump),
 }
 
+/// Per-tick player input, captured each frame in `Update` and consumed in `FixedUpdate`.
+///
+/// Held inputs (`desired_motion`, `jump`) reflect the latest sample. Edge events
+/// (`cast_queue`, `respawn`) are latched until the simulation drains them, so a click
+/// that lands between two fixed steps is never lost. This split is the minimum
+/// structure that lets the simulation be a pure function of input — a prerequisite
+/// for client-side prediction and server reconciliation in multiplayer.
+#[derive(Resource, Default)]
+struct PlayerInput {
+    desired_motion: Vec3,
+    jump: bool,
+    cast_queue: Vec<PendingCast>,
+    respawn: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingCast {
+    origin: Vec3,
+    direction: Vec3,
+}
+
 #[derive(Debug, Resource)]
 struct CameraSettings {
     pitch_speed: f32,
@@ -83,9 +104,19 @@ fn main() {
         ))
         .insert_resource(GlobalAmbientLight::NONE)
         .init_resource::<CameraSettings>()
+        .init_resource::<PlayerInput>()
         .add_systems(Startup, (setup, lock_cursor))
-        .add_systems(Update, (respawn_player, first_person_camera, player_controls, cast_spell).chain())
-        .add_systems(Update, despawn_expired_spells)
+        .add_systems(Update, (first_person_camera, capture_input).chain())
+        .add_systems(
+            FixedUpdate,
+            (
+                respawn_player,
+                player_controls.in_set(TnuaUserControlsSystems),
+                cast_spell,
+                despawn_expired_spells,
+            )
+                .chain(),
+        )
         .run();
 }
 
@@ -196,22 +227,11 @@ fn lock_cursor(mut cursor: Single<&mut CursorOptions, With<Window>>) {
     cursor.visible = false;
 }
 
-fn respawn_player(
-    mut player: Single<(&mut Transform, &mut LinearVelocity, &mut AngularVelocity), With<Player>>,
+fn capture_input(
+    mut input: ResMut<PlayerInput>,
     key_input: Res<ButtonInput<KeyCode>>,
-) {
-    if key_input.just_pressed(KeyCode::Escape) {
-        let (transform, linear_vel, angular_vel) = &mut *player;
-        transform.translation = PLAYER_SPAWN;
-        linear_vel.0 = Vec3::ZERO;
-        angular_vel.0 = Vec3::ZERO;
-    }
-}
-
-fn player_controls(
-    mut controller: Single<&mut TnuaController<PlayerActions>, With<Player>>,
-    camera: Single<&Transform, (With<Camera>, Without<Player>)>,
-    key_input: Res<ButtonInput<KeyCode>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    camera: Single<&Transform, With<Camera>>,
 ) {
     const BINDINGS: [(KeyCode, Vec3); 4] = [
         (KeyCode::KeyW, Vec3::Z),
@@ -220,20 +240,50 @@ fn player_controls(
         (KeyCode::KeyD, Vec3::NEG_X),
     ];
 
-    let input: Vec3 = BINDINGS
+    let local: Vec3 = BINDINGS
         .iter()
         .filter(|(key, _)| key_input.pressed(*key))
         .map(|(_, dir)| *dir)
         .sum::<Vec3>()
         .normalize_or_zero();
 
-    // Project camera direction onto XZ plane for camera-relative movement
     let forward = camera.forward().as_vec3();
     let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
     let right = Vec3::Y.cross(forward).normalize_or_zero();
-
     let sprint = if key_input.pressed(KeyCode::ShiftLeft) { 3.0 } else { 1.0 };
-    let desired_motion = (forward * input.z + right * input.x) * sprint;
+
+    input.desired_motion = (forward * local.z + right * local.x) * sprint;
+    input.jump = key_input.pressed(KeyCode::Space);
+
+    if mouse_buttons.just_pressed(MouseButton::Left) {
+        input.cast_queue.push(PendingCast {
+            origin: camera.transform_point(WAND_TIP_OFFSET),
+            direction: camera.forward().as_vec3(),
+        });
+    }
+    if key_input.just_pressed(KeyCode::Escape) {
+        input.respawn = true;
+    }
+}
+
+fn respawn_player(
+    mut player: Single<(&mut Transform, &mut LinearVelocity, &mut AngularVelocity), With<Player>>,
+    mut input: ResMut<PlayerInput>,
+) {
+    if !std::mem::take(&mut input.respawn) {
+        return;
+    }
+    let (transform, linear_vel, angular_vel) = &mut *player;
+    transform.translation = PLAYER_SPAWN;
+    linear_vel.0 = Vec3::ZERO;
+    angular_vel.0 = Vec3::ZERO;
+}
+
+fn player_controls(
+    mut controller: Single<&mut TnuaController<PlayerActions>, With<Player>>,
+    input: Res<PlayerInput>,
+) {
+    let desired_motion = input.desired_motion;
     let desired_forward = Dir3::new(desired_motion).ok();
 
     controller.initiate_action_feeding();
@@ -244,7 +294,7 @@ fn player_controls(
         ..default()
     };
 
-    if key_input.pressed(KeyCode::Space) {
+    if input.jump {
         controller.action(PlayerActions::Jump(default()));
     }
 }
@@ -253,31 +303,25 @@ fn cast_spell(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FlameOrbMaterial>>,
-    camera: Single<&Transform, With<Camera>>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mut input: ResMut<PlayerInput>,
 ) {
-    if !mouse_buttons.just_pressed(MouseButton::Left) {
-        return;
+    for cast in input.cast_queue.drain(..) {
+        commands.spawn((
+            Spell { timer: Timer::from_seconds(SPELL_LIFETIME, TimerMode::Once) },
+            Mesh3d(meshes.add(Sphere { radius: SPELL_RADIUS })),
+            MeshMaterial3d(materials.add(FlameOrbMaterial {
+                core_color: LinearRgba::new(10.0, 6.0, 1.5, 1.0),
+                flame_speed: 1.0,
+            })),
+            Transform::from_translation(cast.origin),
+            RigidBody::Dynamic,
+            Collider::sphere(SPELL_RADIUS),
+            Sensor,
+            CollidingEntities::default(),
+            LinearVelocity(cast.direction * SPELL_SPEED),
+            GravityScale(0.0),
+        ));
     }
-
-    let spawn_pos = camera.transform_point(WAND_TIP_OFFSET);
-    let direction = camera.forward().as_vec3();
-
-    commands.spawn((
-        Spell { timer: Timer::from_seconds(SPELL_LIFETIME, TimerMode::Once) },
-        Mesh3d(meshes.add(Sphere { radius: SPELL_RADIUS })),
-        MeshMaterial3d(materials.add(FlameOrbMaterial {
-            core_color: LinearRgba::new(10.0, 6.0, 1.5, 1.0),
-            flame_speed: 1.0,
-        })),
-        Transform::from_translation(spawn_pos),
-        RigidBody::Dynamic,
-        Collider::sphere(SPELL_RADIUS),
-        Sensor,
-        CollidingEntities::default(),
-        LinearVelocity(direction * SPELL_SPEED),
-        GravityScale(0.0),
-    ));
 }
 
 fn despawn_expired_spells(
