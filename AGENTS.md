@@ -4,25 +4,45 @@ This file provides guidance to agents such as Claude Code when working with code
 
 # Project Overview
 
-// Todo
+First-person fantasy spell-dueling game. Long term: MMO-scale PvP. Currently a
+server-authoritative multiplayer MVP. Design docs live in design/.
 
 # Repository Structure
 
-The Rust/Bevy game code lives in the `code/` subdirectory. 
-This repo will at some point also contain other contents, like game design docs,
-textures, etc.
+code/ is a Cargo workspace with three crates:
+
+- shared: simulation types and systems, headless-compilable
+- server: headless authoritative binary
+- client: graphical binary with rendering and input
+
+code/bevy/ is a checked-in copy of the Bevy source for reference only, not a
+workspace member.
 
 # Code part
 
-Rust game project using **Bevy 0.18.1** (edition 2024).
+Rust game project using Bevy 0.18.1 (edition 2024).
 
 ## Build & Run Commands
 
-- **Build:** `cd code && cargo build`
-- **Run:** `cd code && cargo run`
-- **Check (fast compile check):** `cd code && cargo check`
+Run from code/. The Justfile has shortcuts.
 
-After making code changes, always kill existing game processes and relaunch the game so the user can test immediately.
+- just server: run the headless server
+- just client: run a client (optionally pass host:port for a remote server)
+
+For multiplayer testing, run the server in one terminal and clients in others.
+Clients default to 127.0.0.1:5000.
+
+After changes, kill running processes and relaunch. Changes in shared/ require
+restarting both sides.
+
+## Multiplayer architecture
+
+The server runs authoritative simulation and physics. Clients render replicated
+state and forward inputs each tick. The sim/render split is enforced by the
+crate boundary: only the server loads physics and sim systems.
+
+No client-side prediction or interpolation yet, so the local player sees
+themselves at the latest replicated position. Next step is local prediction.
 
 
 ## Always read the Bevy source code
