@@ -1,10 +1,12 @@
 use std::{
+    collections::VecDeque,
     env,
     f32::consts::FRAC_PI_2,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     time::SystemTime,
 };
 
+use avian3d::prelude::*;
 use bevy::{
     camera::Exposure,
     core_pipeline::tonemapping::Tonemapping,
@@ -29,9 +31,10 @@ use bevy_replicon_renet::{
     renet::ConnectionConfig,
 };
 use shared::{
-    DEFAULT_PORT, InputMessage, PLAYER_CYLINDER_HEIGHT, PLAYER_RADIUS, PROTOCOL_ID, PendingCast,
-    Player, PlayerInput, PlayerOwner, SPELL_RADIUS, SharedReplicationPlugin, Spell,
-    WAND_TIP_OFFSET, WORLD_CUBES,
+    DEFAULT_PORT, InputMessage, LastProcessedInput, PLAYER_CYLINDER_HEIGHT, PLAYER_RADIUS,
+    PROTOCOL_ID, PendingCast, Player, PlayerActionsConfig, PlayerInput, PlayerOwner,
+    PlayerPhysicsPlugin, SPELL_RADIUS, SharedReplicationPlugin, Spell, TnuaUserControlsSystems,
+    WAND_TIP_OFFSET, WORLD_CUBES, insert_player_sim_bundle,
 };
 
 // --- Types ---
@@ -48,9 +51,43 @@ struct CameraSettings {
 #[derive(Resource, Clone, Copy)]
 struct LocalClientId(u64);
 
+/// Client-local monotonic tick counter, advanced once per FixedUpdate.
+///
+/// Stamped onto every outgoing `InputMessage` so the server can echo it back
+/// via `LastProcessedInput`. Reconciliation (Step 2) will use this to align
+/// server snapshots with the client's predicted-state history.
+#[derive(Resource, Default, Clone, Copy)]
+struct ClientTick(u32);
+
 /// Marker for the player entity that belongs to this client.
 #[derive(Component)]
 struct LocalPlayer;
+
+/// Ring buffer of `(client_tick, post-physics transform)` for the local player,
+/// recorded each `FixedPostUpdate`. Reconciliation looks up the entry whose
+/// tick matches the server's `LastProcessedInput` to compare predicted vs
+/// authoritative state.
+///
+/// Capped at `PREDICTED_HISTORY_CAPACITY` entries (~2 s at 128 Hz). Older
+/// entries fall off the front; if the server's ack is older than the buffer,
+/// we treat it as "too old to reconcile" and accept the snapshot.
+#[derive(Component, Default)]
+struct PredictedHistory {
+    entries: VecDeque<(u32, Transform)>,
+}
+
+/// Max number of (tick, transform) entries kept on `PredictedHistory`.
+/// 256 ticks ≈ 2 s at 128 Hz — comfortably more than any plausible RTT.
+const PREDICTED_HISTORY_CAPACITY: usize = 256;
+
+/// Distance threshold (meters) above which a server snapshot is treated as a
+/// real mispredict and snapped to. Below this, the client keeps its prediction
+/// and ignores the server's correction.
+///
+/// Steady-state drift in normal play is ~0.07 m (Tnua spring oscillation phase
+/// difference between client and server), so 0.5 m gives ample headroom while
+/// still catching real desyncs like walking through geometry or teleports.
+const RECONCILE_SNAP_THRESHOLD: f32 = 0.5;
 
 /// Marker for the on-screen network status text node.
 #[derive(Component)]
@@ -98,15 +135,23 @@ fn main() {
                 },
             },
             MaterialPlugin::<FlameOrbMaterial>::default(),
+            PlayerPhysicsPlugin,
         ))
         .insert_resource(GlobalAmbientLight::NONE)
         // Match the server's tick rate so `send_input` fires at the same cadence
-        // the server consumes inputs, instead of the default 64 Hz.
-        .insert_resource(Time::<Fixed>::from_hz(128.0))
+        // the server consumes inputs.
+        .insert_resource(Time::<Fixed>::from_hz(64.0))
         .init_resource::<CameraSettings>()
+        .init_resource::<ClientTick>()
         .add_systems(
             Startup,
             (setup_world, setup_network, lock_cursor, spawn_network_overlay),
+        )
+        .add_systems(
+            PreUpdate,
+            reconcile_local_player
+                .after(ClientSystems::Receive)
+                .run_if(local_player_exists),
         )
         .add_systems(
             Update,
@@ -117,7 +162,18 @@ fn main() {
                     .run_if(local_player_exists),
             ),
         )
-        .add_systems(FixedUpdate, send_input.run_if(local_player_exists))
+        .add_systems(
+            FixedUpdate,
+            send_input
+                .before(TnuaUserControlsSystems)
+                .run_if(local_player_exists),
+        )
+        .add_systems(
+            FixedPostUpdate,
+            record_predicted_state
+                .after(PhysicsSystems::Writeback)
+                .run_if(local_player_exists),
+        )
         .add_observer(attach_player_visuals)
         .add_observer(attach_spell_visuals)
         .add_observer(mark_local_player)
@@ -130,11 +186,14 @@ fn setup_world(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
-    // ground visual (no collider — the server is authoritative for physics and the
-    // client doesn't need local collision).
+    // Ground + cubes carry both the visual mesh AND the static collider, so the
+    // client-side physics world (used to predict the local player) has something
+    // to walk on. Server has its own collider-only copies.
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(1000.0, 1000.0))),
         MeshMaterial3d(materials.add(Color::WHITE)),
+        RigidBody::Static,
+        Collider::half_space(Vec3::Y),
     ));
     let cube_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
     for (size, pos) in WORLD_CUBES {
@@ -142,6 +201,8 @@ fn setup_world(
             Mesh3d(meshes.add(Cuboid::new(*size, *size, *size))),
             MeshMaterial3d(cube_material.clone()),
             Transform::from_translation(*pos),
+            RigidBody::Static,
+            Collider::cuboid(*size, *size, *size),
         ));
     }
     // sun
@@ -333,16 +394,109 @@ fn capture_input(
 /// queued cast event (FIFO) and the respawn latch. Remaining casts stay in the
 /// queue for subsequent ticks, so rapid clicks are processed in order rather than
 /// being dropped.
-fn send_input(mut commands: Commands, mut input: Single<&mut PlayerInput, With<LocalPlayer>>) {
+///
+/// Advances `ClientTick` once per call (once per FixedUpdate) and stamps the
+/// outgoing message with it. The server records the latest applied tick on
+/// `LastProcessedInput` so the client can later align reconciliation against
+/// its own predicted-state history at the same tick.
+fn send_input(
+    mut commands: Commands,
+    mut input: Single<&mut PlayerInput, With<LocalPlayer>>,
+    mut tick: ResMut<ClientTick>,
+) {
+    tick.0 = tick.0.wrapping_add(1);
+
     let cast = (!input.cast_queue.is_empty()).then(|| input.cast_queue.remove(0));
     let respawn = std::mem::take(&mut input.respawn);
 
     commands.client_trigger(InputMessage {
+        tick: tick.0,
         desired_motion: input.desired_motion,
         jump: input.jump,
         cast,
         respawn,
     });
+}
+
+/// Records the local player's post-physics transform tagged with the current
+/// `ClientTick`. Runs in `FixedPostUpdate`, so by the time it sees the
+/// transform, both `player_controls` and Avian's integration step have run.
+fn record_predicted_state(
+    history: Single<(&mut PredictedHistory, &Transform), With<LocalPlayer>>,
+    tick: Res<ClientTick>,
+) {
+    let (mut history, transform) = history.into_inner();
+    history.entries.push_back((tick.0, *transform));
+    while history.entries.len() > PREDICTED_HISTORY_CAPACITY {
+        history.entries.pop_front();
+    }
+}
+
+/// Compares the latest server snapshot for the local player against the
+/// predicted state at the same client tick. If they're close, we keep the
+/// prediction (overwriting the server's authoritative `Transform` with our
+/// latest predicted one). If they diverge by more than `RECONCILE_SNAP_THRESHOLD`,
+/// we accept the server's value as a hard snap, also writing it into Avian's
+/// `Position` so the next physics step actually uses the corrected starting
+/// point (without this, `transform_to_position` skips the sync because
+/// `Position` was just written by the prior physics step, and the snap is
+/// silently undone).
+///
+/// On snap we also clear the entire history — all in-flight predictions are
+/// based on the pre-snap trajectory and would cause cascading mispredicts.
+///
+/// Runs in `PreUpdate` after replicon's receive set, so the `Transform` and
+/// `LastProcessedInput` we read are the just-applied snapshot. Skips frames
+/// where `LastProcessedInput` didn't change — `Query` (not `Single`) is needed
+/// because the `Changed` filter returns zero matches on most frames.
+fn reconcile_local_player(
+    mut local: Query<
+        (
+            &mut Transform,
+            &mut Position,
+            &mut PredictedHistory,
+            &LastProcessedInput,
+        ),
+        (With<LocalPlayer>, Changed<LastProcessedInput>),
+    >,
+) {
+    let Ok((mut transform, mut position, mut history, ack)) = local.single_mut() else {
+        return;
+    };
+    let acked_tick = ack.0;
+
+    let Some(predicted_at_ack) = history
+        .entries
+        .iter()
+        .find(|(t, _)| *t == acked_tick)
+        .map(|(_, transform)| *transform)
+    else {
+        // Server's ack is older than our buffer (or hasn't matched any tick yet).
+        // Accept the server transform as-is and keep predicting forward.
+        return;
+    };
+
+    let drift = transform
+        .translation
+        .distance(predicted_at_ack.translation);
+
+    if drift > RECONCILE_SNAP_THRESHOLD {
+        info!("reconcile snap: drift={drift:.2}m at ack tick {acked_tick}");
+        // Hard snap: server's transform is authoritative. We must also write
+        // Avian's Position; otherwise the next physics step integrates from
+        // the (still-stale) Position and reverts our snap.
+        position.0 = transform.translation;
+        history.entries.clear();
+        return;
+    }
+
+    // Prediction matched. Restore the latest predicted transform so the local
+    // player keeps moving forward without snapping back to the server's older
+    // position. Drop history entries the server has already acked.
+    if let Some((_, latest)) = history.entries.back().copied() {
+        *transform = latest;
+    }
+    history.entries.retain(|(t, _)| *t > acked_tick);
 }
 
 fn first_person_camera(
@@ -362,14 +516,14 @@ fn first_person_camera(
 }
 
 /// Attaches the cached capsule mesh + material to any entity that gains the `Player`
-/// component, plus a local `PlayerInput` so input capture has somewhere to write.
+/// component. Physics + `PlayerInput` are NOT inserted here — they're added only on
+/// the local player by `mark_local_player`, since remote players are pure visuals.
 fn attach_player_visuals(
     insert: On<Insert, Player>,
     handles: Local<PlayerVisualHandles>,
     mut commands: Commands,
 ) {
     commands.entity(insert.entity).insert((
-        PlayerInput::default(),
         Mesh3d(handles.mesh.clone()),
         MeshMaterial3d(handles.material.clone()),
     ));
@@ -389,21 +543,27 @@ fn attach_spell_visuals(
 }
 
 /// Marks the replicated Player entity whose `PlayerOwner` matches our own client id as the
-/// `LocalPlayer`, so the camera and input systems can latch onto it.
+/// `LocalPlayer`, then attaches the full physics + character-controller bundle so the
+/// client can locally simulate it (client-side prediction). Remote players don't get
+/// the bundle and remain pure visuals driven by replicated `Transform`.
 fn mark_local_player(
     insert: On<Insert, PlayerOwner>,
     local: Option<Res<LocalClientId>>,
     owners: Query<&PlayerOwner>,
+    mut configs: ResMut<Assets<PlayerActionsConfig>>,
     mut commands: Commands,
 ) {
     let Some(local) = local else { return };
     let Ok(owner) = owners.get(insert.entity) else {
         return;
     };
-    if owner.0 == local.0 {
-        info!("local player identified: {}", insert.entity);
-        commands.entity(insert.entity).insert(LocalPlayer);
+    if owner.0 != local.0 {
+        return;
     }
+    info!("local player identified: {}", insert.entity);
+    let mut entity = commands.entity(insert.entity);
+    entity.insert((LocalPlayer, PredictedHistory::default()));
+    insert_player_sim_bundle(&mut entity, &mut configs);
 }
 
 impl Material for FlameOrbMaterial {

@@ -8,6 +8,10 @@ use bevy_tnua::prelude::*;
 use bevy_tnua_avian3d::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// Re-exported for the client so it can order systems relative to Tnua's user
+/// control set without depending on bevy_tnua directly.
+pub use bevy_tnua::prelude::TnuaUserControlsSystems;
+
 // --- Constants ---
 
 pub const DEFAULT_PORT: u16 = 5000;
@@ -47,6 +51,13 @@ pub struct Spell;
 /// player entity belongs to them.
 #[derive(Component, Clone, Copy, Serialize, Deserialize)]
 pub struct PlayerOwner(pub u64);
+
+/// The latest client-input tick the server has applied for this player.
+///
+/// Replicated back to the owning client so reconciliation can match a server
+/// snapshot against the client's predicted-state history at the same tick.
+#[derive(Component, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct LastProcessedInput(pub u32);
 
 // --- Sim-only components ---
 
@@ -93,8 +104,14 @@ pub struct PendingCast {
 /// Non-incremental: the server simply overwrites its copy of the player's
 /// `PlayerInput` fields with each message. The client sends one of these per
 /// FixedUpdate tick.
+///
+/// `tick` is the client's monotonic FixedUpdate counter at the time the input
+/// was captured. The server records the latest applied value in
+/// `LastProcessedInput`, which is replicated back so the client can reconcile
+/// its predicted state against the matching authoritative snapshot.
 #[derive(Event, Serialize, Deserialize, Clone)]
 pub struct InputMessage {
+    pub tick: u32,
     pub desired_motion: Vec3,
     pub jump: bool,
     pub cast: Option<PendingCast>,
@@ -107,10 +124,19 @@ pub struct InputMessage {
 /// Added by both client and server so they share the wire protocol.
 pub struct SharedReplicationPlugin;
 
-/// Adds the authoritative simulation: physics, character controller, and player/spell systems.
-/// Added only by the server in MVP. In the progressive path this will also be added by the
-/// client for predicted entities.
-pub struct SharedSimPlugin;
+/// Physics, character controller, and `player_controls`. Added by **both**
+/// client and server. The client uses it to predict the local player; the
+/// server uses it to authoritatively simulate every player.
+///
+/// Avian only operates on entities that actually have `RigidBody`/`Collider`,
+/// so on the client it's effectively a no-op except for the local player —
+/// remote players carry only `Transform` and don't participate in physics.
+pub struct PlayerPhysicsPlugin;
+
+/// Server-only systems: respawn handling, spell spawning, spell expiration.
+/// These mutate state the client must NOT predict (the server is authoritative
+/// for spells and respawns).
+pub struct ServerSimPlugin;
 
 // --- Impls ---
 
@@ -119,12 +145,13 @@ impl Plugin for SharedReplicationPlugin {
         app.replicate::<Player>()
             .replicate::<Spell>()
             .replicate::<PlayerOwner>()
+            .replicate::<LastProcessedInput>()
             .replicate::<Transform>()
             .add_client_event::<InputMessage>(Channel::Unreliable);
     }
 }
 
-impl Plugin for SharedSimPlugin {
+impl Plugin for PlayerPhysicsPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
             PhysicsPlugins::default(),
@@ -133,13 +160,21 @@ impl Plugin for SharedSimPlugin {
         ))
         .add_systems(
             FixedUpdate,
+            player_controls.in_set(TnuaUserControlsSystems),
+        );
+    }
+}
+
+impl Plugin for ServerSimPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            FixedUpdate,
             (
-                respawn_player,
-                player_controls.in_set(TnuaUserControlsSystems),
-                cast_spell,
-                despawn_expired_spells,
-            )
-                .chain(),
+                respawn_player.before(TnuaUserControlsSystems),
+                (cast_spell, despawn_expired_spells)
+                    .chain()
+                    .after(TnuaUserControlsSystems),
+            ),
         );
     }
 }
@@ -156,9 +191,22 @@ pub fn spawn_player_components(
     commands.insert((
         Player,
         PlayerOwner(owner),
-        PlayerInput::default(),
+        LastProcessedInput::default(),
         Replicated,
         Transform::from_translation(position),
+    ));
+    insert_player_sim_bundle(commands, configs);
+}
+
+/// Inserts the physics + character-controller bundle a player needs to be
+/// simulated locally. Used by both the server (for every player) and the client
+/// (for the local player only, after `mark_local_player` identifies it).
+pub fn insert_player_sim_bundle(
+    commands: &mut EntityCommands,
+    configs: &mut Assets<PlayerActionsConfig>,
+) {
+    commands.insert((
+        PlayerInput::default(),
         RigidBody::Dynamic,
         Collider::capsule(PLAYER_RADIUS, PLAYER_CYLINDER_HEIGHT),
         TnuaController::<PlayerActions>::default(),

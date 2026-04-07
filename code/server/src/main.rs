@@ -10,8 +10,8 @@ use bevy::{
 
 /// Server simulation + replication tick rate. Higher = smoother movement on the
 /// client (less stepping between snapshots) and lower input lag, at the cost of
-/// more CPU and bandwidth. 128 Hz matches Valorant / CS2 competitive standard.
-const SERVER_HZ: f64 = 128.0;
+/// more CPU and bandwidth. 64 Hz is the Bevy default and matches Overwatch.
+const SERVER_HZ: f64 = 64.0;
 use bevy_replicon::{
     prelude::*, shared::backend::connected_client::NetworkId,
 };
@@ -21,8 +21,9 @@ use bevy_replicon_renet::{
     renet::ConnectionConfig,
 };
 use shared::{
-    DEFAULT_PORT, InputMessage, PLAYER_SPAWN, PROTOCOL_ID, PlayerActionsConfig, PlayerInput,
-    SharedReplicationPlugin, SharedSimPlugin, spawn_player_components, spawn_world_colliders,
+    DEFAULT_PORT, InputMessage, LastProcessedInput, PLAYER_SPAWN, PROTOCOL_ID, PlayerActionsConfig,
+    PlayerInput, PlayerPhysicsPlugin, ServerSimPlugin, SharedReplicationPlugin,
+    spawn_player_components, spawn_world_colliders,
 };
 
 fn main() {
@@ -40,7 +41,8 @@ fn main() {
             RepliconPlugins,
             RepliconRenetPlugins,
             SharedReplicationPlugin,
-            SharedSimPlugin,
+            PlayerPhysicsPlugin,
+            ServerSimPlugin,
         ))
         // Tick FixedUpdate (physics + sim systems) at the same rate as the main
         // loop, so replication snapshots are produced once per loop iteration.
@@ -100,14 +102,20 @@ fn spawn_player_on_connect(
     spawn_player_components(&mut entity, &mut configs, PLAYER_SPAWN, network_id.get());
 }
 
-/// Applies an incoming `InputMessage` to the sender's `PlayerInput` component.
+/// Applies an incoming `InputMessage` to the sender's `PlayerInput` component
+/// and records the message tick on `LastProcessedInput` so it replicates back to
+/// the client for reconciliation.
+///
 /// The sender's player character is the same entity as the sender's connection, so
 /// `FromClient::client_id` gives us the entity directly.
-fn apply_input(from: On<FromClient<InputMessage>>, mut players: Query<&mut PlayerInput>) {
+fn apply_input(
+    from: On<FromClient<InputMessage>>,
+    mut players: Query<(&mut PlayerInput, &mut LastProcessedInput)>,
+) {
     let Some(entity) = from.client_id.entity() else {
         return;
     };
-    let Ok(mut input) = players.get_mut(entity) else {
+    let Ok((mut input, mut last_tick)) = players.get_mut(entity) else {
         return;
     };
     input.desired_motion = from.desired_motion;
@@ -118,4 +126,5 @@ fn apply_input(from: On<FromClient<InputMessage>>, mut players: Query<&mut Playe
     if from.respawn {
         input.respawn = true;
     }
+    last_tick.0 = from.tick;
 }

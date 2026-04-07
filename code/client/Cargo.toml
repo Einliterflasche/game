@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 shared = { path = "../shared" }
 bevy = { version = "0.18.1", features = ["dynamic_linking", "bevy_dev_tools", "serialize"] }
+avian3d.workspace = true
 bevy_replicon.workspace = true
 bevy_replicon_renet.workspace = true
 serde.workspace = true
