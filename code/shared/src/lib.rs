@@ -59,6 +59,29 @@ pub struct PlayerOwner(pub u64);
 #[derive(Component, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct LastProcessedInput(pub u32);
 
+/// Marker for "this player has finished tracing a spell pattern and is in
+/// the aim phase, holding the cast ready to fire". Replicated to all clients
+/// so they can render a preview orb on the player and visually telegraph
+/// "this player is about to fire". The owning client also has its own
+/// camera-attached preview for the first-person view.
+#[derive(Component, Clone, Copy, Serialize, Deserialize)]
+pub struct Aiming;
+
+/// World-space camera-forward vector for a player. Replicated so other
+/// clients can position the aim-phase preview orb in front of them in the
+/// direction they're looking. The player's `Transform.rotation` is driven by
+/// Tnua based on movement direction (not look direction), so it can't be
+/// reused for this — the camera pitch/yaw is per-client and only the owning
+/// client knows it. Updated by the server from each `InputMessage`.
+#[derive(Component, Clone, Copy, Serialize, Deserialize)]
+pub struct LookDirection(pub Vec3);
+
+impl Default for LookDirection {
+    fn default() -> Self {
+        Self(Vec3::NEG_Z)
+    }
+}
+
 // --- Sim-only components ---
 
 /// Server-side spell lifetime timer. Not replicated — the client just sees the
@@ -116,6 +139,14 @@ pub struct InputMessage {
     pub jump: bool,
     pub cast: Option<PendingCast>,
     pub respawn: bool,
+    /// `true` while the client is in the aim phase (pattern traced, holding
+    /// LMB before release). The server toggles the `Aiming` marker on the
+    /// player entity based on this so other clients can see the preview orb.
+    pub aiming: bool,
+    /// World-space camera-forward of the sending client. Server stores it
+    /// on `LookDirection` so other clients can position the preview orb in
+    /// front of the aiming player.
+    pub look_forward: Vec3,
 }
 
 // --- Plugins ---
@@ -146,6 +177,8 @@ impl Plugin for SharedReplicationPlugin {
             .replicate::<Spell>()
             .replicate::<PlayerOwner>()
             .replicate::<LastProcessedInput>()
+            .replicate::<Aiming>()
+            .replicate::<LookDirection>()
             .replicate::<Transform>()
             .add_client_event::<InputMessage>(Channel::Unreliable);
     }
@@ -192,6 +225,7 @@ pub fn spawn_player_components(
         Player,
         PlayerOwner(owner),
         LastProcessedInput::default(),
+        LookDirection::default(),
         Replicated,
         Transform::from_translation(position),
     ));

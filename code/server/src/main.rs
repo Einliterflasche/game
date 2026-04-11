@@ -21,9 +21,9 @@ use bevy_replicon_renet::{
     renet::ConnectionConfig,
 };
 use shared::{
-    DEFAULT_PORT, InputMessage, LastProcessedInput, PLAYER_SPAWN, PROTOCOL_ID, PlayerActionsConfig,
-    PlayerInput, PlayerPhysicsPlugin, ServerSimPlugin, SharedReplicationPlugin,
-    spawn_player_components, spawn_world_colliders,
+    Aiming, DEFAULT_PORT, InputMessage, LastProcessedInput, LookDirection, PLAYER_SPAWN,
+    PROTOCOL_ID, PlayerActionsConfig, PlayerInput, PlayerPhysicsPlugin, ServerSimPlugin,
+    SharedReplicationPlugin, spawn_player_components, spawn_world_colliders,
 };
 
 fn main() {
@@ -108,14 +108,25 @@ fn spawn_player_on_connect(
 ///
 /// The sender's player character is the same entity as the sender's connection, so
 /// `FromClient::client_id` gives us the entity directly.
+///
+/// Also reconciles the `Aiming` marker against the message's `aiming` flag —
+/// inserting/removing only on transition to avoid hammering replication every
+/// tick. Other clients see the marker pop on/off and react with their own
+/// preview-orb spawn/despawn logic.
 fn apply_input(
     from: On<FromClient<InputMessage>>,
-    mut players: Query<(&mut PlayerInput, &mut LastProcessedInput)>,
+    mut players: Query<(
+        &mut PlayerInput,
+        &mut LastProcessedInput,
+        &mut LookDirection,
+        Has<Aiming>,
+    )>,
+    mut commands: Commands,
 ) {
     let Some(entity) = from.client_id.entity() else {
         return;
     };
-    let Ok((mut input, mut last_tick)) = players.get_mut(entity) else {
+    let Ok((mut input, mut last_tick, mut look, has_aiming)) = players.get_mut(entity) else {
         return;
     };
     input.desired_motion = from.desired_motion;
@@ -127,4 +138,15 @@ fn apply_input(
         input.respawn = true;
     }
     last_tick.0 = from.tick;
+    look.0 = from.look_forward;
+
+    match (from.aiming, has_aiming) {
+        (true, false) => {
+            commands.entity(entity).insert(Aiming);
+        }
+        (false, true) => {
+            commands.entity(entity).remove::<Aiming>();
+        }
+        _ => {}
+    }
 }

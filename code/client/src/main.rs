@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     env,
     f32::consts::FRAC_PI_2,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
@@ -8,9 +8,10 @@ use std::{
 
 use avian3d::prelude::*;
 use bevy::{
-    camera::Exposure,
+    camera::{visibility::RenderLayers, Exposure},
     core_pipeline::tonemapping::Tonemapping,
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin},
+    gizmos::config::{DefaultGizmoConfigGroup, GizmoLineJoint},
     input::mouse::AccumulatedMouseMotion,
     light::{
         AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder, DirectionalLightShadowMap,
@@ -21,7 +22,7 @@ use bevy::{
     prelude::*,
     render::{
         render_resource::AsBindGroup,
-        view::{ColorGrading, ColorGradingGlobal},
+        view::{ColorGrading, ColorGradingGlobal, Hdr},
     },
     shader::ShaderRef,
     window::{CursorGrabMode, CursorOptions},
@@ -34,8 +35,8 @@ use bevy_replicon_renet::{
     renet::ConnectionConfig,
 };
 use shared::{
-    DEFAULT_PORT, InputMessage, LastProcessedInput, PLAYER_CYLINDER_HEIGHT, PLAYER_RADIUS,
-    PROTOCOL_ID, PendingCast, Player, PlayerActionsConfig, PlayerInput, PlayerOwner,
+    Aiming, DEFAULT_PORT, InputMessage, LastProcessedInput, LookDirection, PLAYER_CYLINDER_HEIGHT,
+    PLAYER_RADIUS, PROTOCOL_ID, PendingCast, Player, PlayerActionsConfig, PlayerInput, PlayerOwner,
     PlayerPhysicsPlugin, SPELL_RADIUS, SharedReplicationPlugin, Spell, TnuaUserControlsSystems,
     WAND_TIP_OFFSET, WORLD_CUBES, insert_player_sim_bundle,
 };
@@ -95,6 +96,69 @@ const PREDICTED_HISTORY_CAPACITY: usize = 256;
 /// reach (`SPELL_SPEED * SPELL_LIFETIME = 36 m`) so anything farther is moot.
 const AIM_RAY_MAX_DISTANCE: f32 = 100.0;
 
+// --- Spell-pattern casting tuning ---
+//
+// Spells require the player to draw a pattern (currently: a vertical line
+// downward from the screen center) while holding LMB. Camera is locked while
+// drawing; release evaluates the trace and either fires the spell or fizzles.
+// All thresholds are fractions of window height for resolution independence.
+
+/// Length of the hint line as a fraction of window height.
+const HINT_LEN_FRAC: f32 = 0.20;
+/// Width of the casting overlay's hint and trace lines, in **logical**
+/// pixels. Multiplied by `Window::scale_factor()` each frame before being
+/// written to the gizmo config (gizmo `line.width` is in physical pixels —
+/// see `bevy_gizmos_render/src/lines.wgsl:131`), so the overlay reads the
+/// same visual thickness on retina and non-retina displays.
+const OVERLAY_LINE_WIDTH_LOGICAL_PX: f32 = 30.0;
+/// Maximum allowed lateral deviation of any sample from the hint line, as a
+/// fraction of window height. Smaller = stricter shape match.
+const MAX_DEVIATION_FRAC: f32 = 0.025;
+/// Trace must reach at least this fraction of `hint_len` below the start at
+/// some point. Catches "scribble around the start then fling to the tip".
+const MIN_REACH_FRAC: f32 = 0.90;
+/// Minimum distance (in screen pixels) the cursor must travel since the last
+/// recorded sample before we append a new one. Keeps the buffer bounded when
+/// the player is mostly still.
+const SAMPLE_MIN_DIST_PX: f32 = 2.0;
+/// Duration of the red-flash fizzle animation on a failed cast.
+const FIZZLE_DURATION_SECS: f32 = 0.3;
+
+/// State machine for the spell-drawing gesture.
+///
+/// Flow: `Idle` → (LMB down) `Drawing` → (pattern satisfied) `Aiming` →
+/// (LMB up) fire spell → `Idle`. Drawing → (LMB up without satisfying) →
+/// `Fizzling` → (timer) `Idle`.
+///
+/// `Idle`: nothing happening; single click no longer fires anything alone.
+/// `Drawing`: LMB held, camera rotation frozen, hint + trace visible. Origin
+///   and direction are **not** cached — they're recomputed at fire time so
+///   the spell launches from the player's current position rather than from
+///   wherever they clicked.
+/// `Aiming`: pattern was traced correctly and the player is still holding
+///   LMB. Camera rotation re-enables so the player can aim. The casting
+///   overlay is hidden and the regular crosshair returns. Releasing LMB
+///   fires the spell using the current camera transform; clicking again
+///   does nothing because LMB is already pressed.
+/// `Fizzling`: LMB released without satisfying the pattern. The trace fades
+///   out red. Camera rotation is unlocked during fizzling.
+#[derive(Resource, Default)]
+enum CastingState {
+    #[default]
+    Idle,
+    Drawing {
+        /// Cursor position in Camera2d coords (origin = screen center, +y up).
+        cursor: Vec2,
+        /// Sampled cursor positions, oldest first. Always starts with `Vec2::ZERO`.
+        trace: Vec<Vec2>,
+    },
+    Aiming,
+    Fizzling {
+        trace: Vec<Vec2>,
+        timer: Timer,
+    },
+}
+
 /// Distance threshold (meters) above which a server snapshot is treated as a
 /// real mispredict and snapped to. Below this, the client keeps its prediction
 /// and ignores the server's correction.
@@ -107,6 +171,41 @@ const RECONCILE_SNAP_THRESHOLD: f32 = 0.5;
 /// Marker for the on-screen network status text node.
 #[derive(Component)]
 struct NetworkOverlay;
+
+/// Marker for the white-dot crosshair UI node. Used by
+/// `update_crosshair_visibility` to hide it while a spell is being drawn —
+/// the casting overlay (hint + trace) replaces it during that state.
+#[derive(Component)]
+struct Crosshair;
+
+/// Marker for the local-only "armed spell" preview orb. Spawned as a child of
+/// the camera while `CastingState::Aiming` so it rides the camera transform
+/// exactly (same trick the wand cylinder uses). Despawned the moment the
+/// player leaves the aim phase — either by firing, fizzling, or pressing Esc.
+/// Not replicated: only the casting player should see their armed spell.
+#[derive(Component)]
+struct PreviewOrb;
+
+/// Third-person preview orb for any non-local player who is currently in
+/// the aim phase. Spawned as a top-level entity by `sync_remote_preview_orbs`
+/// — *not* a child of the player — because the orb's position is computed
+/// from the player's `LookDirection` (the camera-forward, world space), but
+/// the player's `Transform` rotation is Tnua's movement-direction facing,
+/// which is unrelated. Putting the orb in world space and updating it each
+/// frame is simpler than juggling parent-frame inverse transforms.
+///
+/// Stores its owner so the reconcile pass knows which player's
+/// `Transform` + `LookDirection` to read, and can despawn the orb when the
+/// owner stops aiming or disconnects.
+///
+/// The local player gets *no* third-person preview — they have their own
+/// camera-child `PreviewOrb` for the first-person view. Other clients spawn
+/// these previews on the local player's behalf when they receive the
+/// replicated `Aiming` marker.
+#[derive(Component)]
+struct RemotePreviewOrb {
+    player: Entity,
+}
 
 /// Cached handles for the player capsule visual. One mesh + one material shared
 /// across every replicated player, so we don't allocate new GPU resources per spawn.
@@ -162,6 +261,7 @@ fn main() {
         .init_resource::<CameraSettings>()
         .init_resource::<ClientTick>()
         .init_resource::<CursorEngaged>()
+        .init_resource::<CastingState>()
         .add_systems(
             Startup,
             (
@@ -169,6 +269,7 @@ fn main() {
                 setup_network,
                 spawn_network_overlay,
                 spawn_crosshair,
+                setup_overlay_gizmos,
             ),
         )
         .add_systems(
@@ -182,7 +283,21 @@ fn main() {
             (
                 update_network_overlay,
                 cursor_toggle,
-                (first_person_camera, capture_input)
+                (
+                    // `first_person_camera` always runs so the camera
+                    // translation keeps tracking the player. The rotation
+                    // freeze during drawing is handled inside the function so
+                    // the player doesn't get visually teleported on release.
+                    first_person_camera,
+                    capture_movement_input,
+                    capture_casting_input,
+                    tick_fizzle,
+                    update_crosshair_visibility,
+                    sync_preview_orb,
+                    sync_remote_preview_orbs,
+                    update_gizmo_line_width,
+                    draw_casting_overlay.run_if(is_drawing_or_fizzling),
+                )
                     .chain()
                     .after(cursor_toggle)
                     .run_if(local_player_exists)
@@ -253,6 +368,11 @@ fn setup_world(
     commands
         .spawn((
             Camera3d::default(),
+            // Marker so the existing UI nodes (crosshair, network overlay)
+            // keep targeting THIS camera after we add the order=1 Camera2d
+            // overlay below. Without this, `DefaultUiCamera::get` picks the
+            // highest-order camera and the UI silently retargets to the 2D one.
+            IsDefaultUiCamera,
             Transform::from_translation(Vec3::Y * 2.0),
             // Bloom + tonemapping already smooth the image; MSAA's per-edge
             // fragment-shader cost isn't worth it on the current pipeline.
@@ -297,6 +417,73 @@ fn setup_world(
             Transform::from_xyz(0.25, -0.15, -0.4)
                 .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
         ));
+
+    // Pixel-perfect 2D overlay camera for the spell-casting gizmos (hint
+    // line, draw cursor, trace). `order: 1` puts it after the 3D camera so it
+    // composites over the rendered scene; `ClearColorConfig::None` means it
+    // doesn't wipe what the 3D pass drew. Camera2d's default ortho projection
+    // uses `ScalingMode::WindowSize` (1 unit = 1 logical px) with the origin
+    // at the screen center, so `Vec2::ZERO` in gizmo coords is dead center.
+    //
+    // CRITICAL: `Hdr` and `Msaa::Off` must match the Camera3d above.
+    // `prepare_view_targets` (bevy_render/src/view/mod.rs:1104) keys
+    // intermediate textures on `(target, texture_usage, hdr, msaa)`. If any
+    // of those differ, this camera gets its OWN intermediate texture which
+    // starts uninitialized (black) and ClearColorConfig::None means we don't
+    // clear it — so when it composites to the window it overwrites the 3D
+    // output and the screen goes black.
+    //
+    // `RenderLayers::layer(1)` keeps the gizmo overlay on a dedicated layer.
+    // Bevy's `linestrip_2d`/`line_2d` extend Vec2 → Vec3 (z=0) and queue into
+    // the same gizmo buffer the 3D pipeline reads from, so without a layer
+    // filter the casting gizmos would *also* be drawn at world position
+    // (cursor.x, cursor.y, 0) by Camera3d — visible as a duplicate "zoomed
+    // in" copy somewhere in the scene. Pairs with the GizmoConfigStore tweak
+    // in `setup_overlay_gizmos` that puts the default gizmo group on layer 1.
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: 1,
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        Hdr,
+        Msaa::Off,
+        RenderLayers::layer(1),
+    ));
+}
+
+/// Routes the default gizmo config group to render layer 1 only and enables
+/// rounded line joints so the trace reads as a continuous thick stroke
+/// instead of a chain of independent quads. With the default
+/// `GizmoLineJoint::None`, every consecutive pair of trace samples renders
+/// as two unjoined quads — at the 30 px width the player asked for, the
+/// quads' perpendicular edges visibly mismatch at every angle change and the
+/// trace appears to "jump left and right". Round joints stitch the gaps.
+///
+/// The casting overlay's Camera2d is the only thing on layer 1, so gizmos
+/// render exclusively through it and don't get duplicated by Camera3d. Line
+/// width is set per-frame by `update_gizmo_line_width` because it depends on
+/// the live window scale factor (can change at runtime when the window moves
+/// between displays).
+fn setup_overlay_gizmos(mut store: ResMut<GizmoConfigStore>) {
+    let (config, _) = store.config_mut::<DefaultGizmoConfigGroup>();
+    config.render_layers = RenderLayers::layer(1);
+    config.line.joints = GizmoLineJoint::Round(8);
+}
+
+/// Keeps `GizmoConfig::line.width` in sync with the current window scale
+/// factor so the overlay reads as `OVERLAY_LINE_WIDTH_LOGICAL_PX` *logical*
+/// pixels regardless of display DPI. Cheap (one read + one multiply + one
+/// write per frame); runs unconditionally so the value is correct the first
+/// frame the player enters casting mode.
+fn update_gizmo_line_width(
+    mut store: ResMut<GizmoConfigStore>,
+    window: Single<&Window>,
+) {
+    let scale = window.scale_factor().max(1.0);
+    let (config, _) = store.config_mut::<DefaultGizmoConfigGroup>();
+    config.line.width = OVERLAY_LINE_WIDTH_LOGICAL_PX * scale;
 }
 
 fn setup_network(mut commands: Commands, channels: Res<RepliconChannels>) {
@@ -338,9 +525,14 @@ fn setup_network(mut commands: Commands, channels: Res<RepliconChannels>) {
 /// frame regardless of player state — you should be able to free the mouse
 /// even before connecting. The engaging click is consumed via
 /// `clear_just_pressed` so the same press doesn't immediately fall through to
-/// `capture_input` and fire a spell.
+/// `capture_casting_input` and start a cast.
+///
+/// On disengage we also reset `CastingState` to `Idle`. Otherwise, hitting
+/// Esc mid-draw would leave the state machine stuck in `Drawing` and the next
+/// click after re-engaging would be treated as a continuation, not a new cast.
 fn cursor_toggle(
     mut engaged: ResMut<CursorEngaged>,
+    mut casting: ResMut<CastingState>,
     mut cursor: Single<&mut CursorOptions, With<Window>>,
     mut mouse_buttons: ResMut<ButtonInput<MouseButton>>,
     key_input: Res<ButtonInput<KeyCode>>,
@@ -356,6 +548,7 @@ fn cursor_toggle(
         engaged.0 = false;
         cursor.grab_mode = CursorGrabMode::None;
         cursor.visible = true;
+        *casting = CastingState::Idle;
     }
 }
 
@@ -389,12 +582,14 @@ fn spawn_network_overlay(mut commands: Commands) {
     ));
 }
 
-/// Spawns a tiny white square in the exact center of the screen — the GTA‑style
+/// Spawns a tiny white circle in the exact center of the screen — the GTA‑style
 /// "single point" crosshair. Centered via `50%` + a negative half-size margin so
 /// the dot's center, not its top-left, sits at the screen midpoint.
+/// `BorderRadius::MAX` rounds the square node into a circle.
 fn spawn_crosshair(mut commands: Commands) {
     const SIZE: f32 = 4.0;
     commands.spawn((
+        Crosshair,
         Node {
             position_type: PositionType::Absolute,
             left: Val::Percent(50.0),
@@ -406,10 +601,133 @@ fn spawn_crosshair(mut commands: Commands) {
                 top: Val::Px(-SIZE / 2.0),
                 ..default()
             },
+            // `BorderRadius::MAX` rounds the square node into a circle.
+            border_radius: BorderRadius::MAX,
             ..default()
         },
-        BackgroundColor(Color::WHITE),
+        BackgroundColor(Color::WHITE.with_alpha(0.8)),
     ));
+}
+
+/// Hides the static crosshair while a spell is being drawn (or fizzling) so
+/// it doesn't sit in the middle of the casting overlay. Visible during
+/// `Idle` (normal play) and `Aiming` (the crosshair is exactly what the
+/// player needs while picking a target before release).
+fn update_crosshair_visibility(
+    state: Res<CastingState>,
+    mut crosshair: Single<&mut Visibility, With<Crosshair>>,
+) {
+    **crosshair = match *state {
+        CastingState::Idle | CastingState::Aiming => Visibility::Inherited,
+        CastingState::Drawing { .. } | CastingState::Fizzling { .. } => Visibility::Hidden,
+    };
+}
+
+/// Reconciles a top-level `RemotePreviewOrb` for every aiming non-local
+/// player. Mirror of `sync_preview_orb` for the third-person view: the
+/// local first-person preview is a child of the camera, this one is a
+/// world-space orb positioned at the equivalent "wand tip" of a remote
+/// player using their replicated `LookDirection`.
+///
+/// Position math mirrors what the local first-person view does: the camera
+/// sits `EYE_HEIGHT_OFFSET` above the player's center, and the wand tip is
+/// `WAND_TIP_OFFSET` in the camera's local frame. We reconstruct the camera
+/// transform with `Transform::from_translation(...).looking_to(look, Y)` and
+/// transform the wand offset through it.
+///
+/// The local player is filtered out via `Without<LocalPlayer>` — they have
+/// their own camera-child `PreviewOrb` for first-person and don't need this
+/// one. Other connected clients see the local player's preview because *they*
+/// run this same system and the local player isn't *their* `LocalPlayer`.
+///
+/// Reconcile pass: build a `player → desired_pos` map for currently-aiming
+/// non-local players, then walk existing previews. Each existing preview
+/// either has its transform updated (owner still aiming) or is despawned
+/// (owner stopped aiming or disconnected — both look the same here:
+/// not in the map). Spawn previews for any aiming player who doesn't yet
+/// have one.
+fn sync_remote_preview_orbs(
+    aiming_players: Query<
+        (Entity, &Transform, &LookDirection),
+        (With<Player>, With<Aiming>, Without<LocalPlayer>),
+    >,
+    mut previews: Query<(Entity, &RemotePreviewOrb, &mut Transform), Without<Player>>,
+    handles: Local<SpellVisualHandles>,
+    mut commands: Commands,
+) {
+    // Eye height matches `first_person_camera`'s `eye_offset`. The camera
+    // sits a hair below the top of the capsule.
+    const EYE_HEIGHT_OFFSET: f32 = PLAYER_CYLINDER_HEIGHT / 2.0 + PLAYER_RADIUS - 0.1;
+
+    let desired: HashMap<Entity, Vec3> = aiming_players
+        .iter()
+        .map(|(entity, player_xform, look)| {
+            let camera_pos = player_xform.translation + Vec3::Y * EYE_HEIGHT_OFFSET;
+            let camera_xform = Transform::from_translation(camera_pos)
+                .looking_to(look.0, Vec3::Y);
+            (entity, camera_xform.transform_point(WAND_TIP_OFFSET))
+        })
+        .collect();
+
+    let mut already_spawned = HashSet::new();
+    for (orb_entity, orb_owner, mut orb_xform) in &mut previews {
+        if let Some(&pos) = desired.get(&orb_owner.player) {
+            orb_xform.translation = pos;
+            already_spawned.insert(orb_owner.player);
+        } else {
+            commands.entity(orb_entity).despawn();
+        }
+    }
+
+    for (player, &pos) in &desired {
+        if already_spawned.contains(player) {
+            continue;
+        }
+        commands.spawn((
+            RemotePreviewOrb { player: *player },
+            Mesh3d(handles.mesh.clone()),
+            MeshMaterial3d(handles.material.clone()),
+            Transform::from_translation(pos),
+        ));
+    }
+}
+
+/// Keeps a single `PreviewOrb` entity attached to the camera while the
+/// player is in `Aiming`, despawning it the moment the state changes. The
+/// orb is a child of the `Camera3d` entity, so its local
+/// `Transform::from_translation(WAND_TIP_OFFSET)` is automatically composed
+/// with the camera's global transform — the orb tracks every walk and
+/// camera turn for free, no per-frame position update needed.
+///
+/// Reconcile-style: each frame compare desired vs. actual and add or remove
+/// as needed. Handles all four ways out of `Aiming` (fire, ESC reset,
+/// future fizzle path, anything else) without scattering despawn calls.
+fn sync_preview_orb(
+    state: Res<CastingState>,
+    existing: Query<Entity, With<PreviewOrb>>,
+    camera: Single<Entity, With<Camera3d>>,
+    handles: Local<SpellVisualHandles>,
+    mut commands: Commands,
+) {
+    let should_exist = matches!(*state, CastingState::Aiming);
+    match (should_exist, existing.iter().next()) {
+        (true, None) => {
+            commands.entity(*camera).with_children(|parent| {
+                parent.spawn((
+                    PreviewOrb,
+                    Mesh3d(handles.mesh.clone()),
+                    MeshMaterial3d(handles.material.clone()),
+                    Transform::from_translation(WAND_TIP_OFFSET),
+                ));
+            });
+        }
+        (false, Some(_)) => {
+            for entity in &existing {
+                commands.entity(entity).despawn();
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Updates the network overlay text from replicon's `ClientState` + `ClientStats`.
@@ -441,13 +759,13 @@ fn local_player_exists(query: Query<(), With<LocalPlayer>>) -> bool {
     !query.is_empty()
 }
 
-fn capture_input(
+/// Captures movement input (WASD + jump + Shift sneak). Click handling lives
+/// in `capture_casting_input`. WASD keeps working while drawing a spell so the
+/// player can dodge mid-cast.
+fn capture_movement_input(
     mut input: Single<&mut PlayerInput, With<LocalPlayer>>,
     key_input: Res<ButtonInput<KeyCode>>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
-    camera: Single<&Transform, With<Camera>>,
-    local_player: Single<Entity, With<LocalPlayer>>,
-    spatial_query: SpatialQuery,
+    camera: Single<&Transform, With<Camera3d>>,
 ) {
     const BINDINGS: [(KeyCode, Vec3); 4] = [
         (KeyCode::KeyW, Vec3::Z),
@@ -477,33 +795,193 @@ fn capture_input(
 
     input.desired_motion = (forward * local.z + right * local.x) * speed_mult;
     input.jump = key_input.pressed(KeyCode::Space);
+}
 
-    if mouse_buttons.just_pressed(MouseButton::Left) {
-        // Aim ray from the camera (the crosshair is the camera ray, not the
-        // wand ray). Exclude the local player's own collider so we don't
-        // immediately hit the capsule we're standing inside.
-        let camera_pos = camera.translation;
-        let camera_fwd = camera.forward();
-        let filter = SpatialQueryFilter::from_excluded_entities([*local_player]);
-        let aim_distance = spatial_query
-            .cast_ray(camera_pos, camera_fwd, AIM_RAY_MAX_DISTANCE, true, &filter)
-            .map(|hit| hit.distance)
-            .unwrap_or(AIM_RAY_MAX_DISTANCE);
-        let target = camera_pos + camera_fwd * aim_distance;
-
-        // The spell still leaves the wand tip, but its direction now aims at
-        // the world point under the crosshair instead of being parallel to
-        // the camera forward (which had a 25 cm parallax offset).
-        let wand_tip = camera.transform_point(WAND_TIP_OFFSET);
-        let direction = Dir3::new(target - wand_tip)
-            .map(|d| d.as_vec3())
-            .unwrap_or(camera_fwd.as_vec3());
-
-        input.cast_queue.push(PendingCast {
-            origin: wand_tip,
-            direction,
-        });
+/// State machine for the draw-to-cast gesture. The only writer of
+/// `CastingState` and the only path that enqueues a `PendingCast`.
+///
+/// Click-down (any state except `Drawing`/`Aiming`): enter `Drawing` with the
+/// cursor seeded at the screen center. Falls through into the drag /
+/// pattern-check / release handling so a same-frame click+release (rare, but
+/// possible — `just_pressed` and `just_released` are independent) still gets
+/// evaluated.
+///
+/// Drag (`Drawing`): integrate raw mouse delta into the screen-space cursor.
+/// Mouse delta is +y down (winit convention); Camera2d is +y up; we negate.
+///
+/// Pattern complete (`Drawing` → `Aiming`): once `pattern_passes` returns
+/// true, transition to `Aiming` without firing. Camera rotation re-enables
+/// so the player can aim with mouse motion before committing.
+///
+/// Release in `Aiming` → fire: recomputes origin (current wand tip) and
+/// direction (current camera ray) at fire time. Camera was free during the
+/// aim phase so this is the latest aim, not the click-down aim.
+///
+/// Release in `Drawing` without satisfying the pattern → `Fizzling`. By
+/// construction we only reach this branch when `pattern_passes` returned
+/// `false` for the current trace.
+fn capture_casting_input(
+    mut state: ResMut<CastingState>,
+    mut input: Single<&mut PlayerInput, With<LocalPlayer>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mouse_motion: Res<AccumulatedMouseMotion>,
+    camera: Single<&Transform, With<Camera3d>>,
+    window: Single<&Window>,
+    local_player: Single<Entity, With<LocalPlayer>>,
+    spatial_query: SpatialQuery,
+) {
+    // --- Aiming: release fires the spell, no other input matters ---
+    if matches!(*state, CastingState::Aiming) {
+        if mouse_buttons.just_released(MouseButton::Left) {
+            let cast = build_cast(&camera, &spatial_query, *local_player);
+            input.cast_queue.push(cast);
+            *state = CastingState::Idle;
+        }
+        return;
     }
+
+    // --- Click-down: enter Drawing if not already, then fall through ---
+    if mouse_buttons.just_pressed(MouseButton::Left)
+        && !matches!(*state, CastingState::Drawing { .. })
+    {
+        *state = CastingState::Drawing {
+            cursor: Vec2::ZERO,
+            trace: vec![Vec2::ZERO],
+        };
+    }
+
+    let CastingState::Drawing { cursor, trace } = &mut *state else {
+        return;
+    };
+
+    // --- Drag: integrate cursor + sample ---
+    let scale = window.scale_factor().max(1.0);
+    let delta = Vec2::new(mouse_motion.delta.x, -mouse_motion.delta.y) / scale;
+    *cursor += delta;
+    if let Some(last) = trace.last()
+        && cursor.distance(*last) >= SAMPLE_MIN_DIST_PX
+    {
+        trace.push(*cursor);
+    }
+
+    // --- Pattern complete: arm the spell, hand off to the aim phase ---
+    if pattern_passes(trace, window.height()) {
+        *state = CastingState::Aiming;
+        return;
+    }
+
+    // --- Release without success: fizzle ---
+    if mouse_buttons.just_released(MouseButton::Left) {
+        let trace = std::mem::take(trace);
+        *state = CastingState::Fizzling {
+            trace,
+            timer: Timer::from_seconds(FIZZLE_DURATION_SECS, TimerMode::Once),
+        };
+    }
+}
+
+/// Builds a `PendingCast` from the current camera state. Used by the aim
+/// phase: at the moment the player releases LMB, we capture origin (current
+/// wand tip) and direction (camera-ray to the world point under the
+/// crosshair, with the local player's collider excluded so we don't hit our
+/// own capsule).
+fn build_cast(
+    camera: &Transform,
+    spatial_query: &SpatialQuery,
+    local_player: Entity,
+) -> PendingCast {
+    let camera_pos = camera.translation;
+    let camera_fwd = camera.forward();
+    let filter = SpatialQueryFilter::from_excluded_entities([local_player]);
+    let aim_distance = spatial_query
+        .cast_ray(camera_pos, camera_fwd, AIM_RAY_MAX_DISTANCE, true, &filter)
+        .map(|hit| hit.distance)
+        .unwrap_or(AIM_RAY_MAX_DISTANCE);
+    let target = camera_pos + camera_fwd * aim_distance;
+    let wand_tip = camera.transform_point(WAND_TIP_OFFSET);
+    let direction = Dir3::new(target - wand_tip)
+        .map(|d| d.as_vec3())
+        .unwrap_or(camera_fwd.as_vec3());
+    PendingCast {
+        origin: wand_tip,
+        direction,
+    }
+}
+
+/// Returns `true` when the trace satisfies the casting pattern (currently:
+/// vertical line drawn down from screen center). Free function so it can be
+/// called inline from the auto-fire branch without borrowing the `state`.
+///
+/// Two checks:
+/// - Maximum lateral deviation must stay within tolerance. For a vertical
+///   hint anchored at `Vec2::ZERO`, perpendicular distance collapses to
+///   `|p.x|`, so this is just the max absolute x across all samples.
+/// - The trace's lowest y must reach at least `MIN_REACH_FRAC * hint_len`
+///   below the start. Catches "scribbled near the start without going down".
+fn pattern_passes(trace: &[Vec2], window_height: f32) -> bool {
+    let hint_len = HINT_LEN_FRAC * window_height;
+    let max_deviation = MAX_DEVIATION_FRAC * window_height;
+    let min_reach_y = -MIN_REACH_FRAC * hint_len;
+
+    let max_lateral = trace
+        .iter()
+        .map(|p| p.x.abs())
+        .fold(0.0_f32, f32::max);
+    let min_y = trace.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+
+    max_lateral < max_deviation && min_y <= min_reach_y
+}
+
+/// Advances the fizzle timer and returns to `Idle` once it's done. Runs every
+/// frame; when the state isn't `Fizzling` it's a no-op.
+fn tick_fizzle(mut state: ResMut<CastingState>, time: Res<Time>) {
+    let CastingState::Fizzling { timer, .. } = &mut *state else {
+        return;
+    };
+    timer.tick(time.delta());
+    if timer.is_finished() {
+        *state = CastingState::Idle;
+    }
+}
+
+/// Renders the hint line and the trace as 2D gizmos. Runs only when state is
+/// `Drawing` or `Fizzling`; nothing is drawn during `Aiming` (the regular
+/// crosshair is what the player needs at that point).
+fn draw_casting_overlay(
+    state: Res<CastingState>,
+    window: Single<&Window>,
+    mut gizmos: Gizmos,
+) {
+    let h = window.height();
+    let hint_len = HINT_LEN_FRAC * h;
+    let start = Vec2::ZERO;
+    let end = Vec2::new(0.0, -hint_len);
+
+    match &*state {
+        CastingState::Idle | CastingState::Aiming => {}
+        CastingState::Drawing { trace, .. } => {
+            gizmos.line_2d(start, end, Color::srgba(1.0, 1.0, 1.0, 0.30));
+            if trace.len() >= 2 {
+                gizmos.linestrip_2d(trace.iter().copied(), Color::srgb(0.55, 0.95, 1.0));
+            }
+        }
+        CastingState::Fizzling { trace, timer } => {
+            let alpha = 1.0 - timer.fraction();
+            if trace.len() >= 2 {
+                gizmos.linestrip_2d(
+                    trace.iter().copied(),
+                    Color::srgba(1.0, 0.2, 0.2, alpha),
+                );
+            }
+        }
+    }
+}
+
+fn is_drawing_or_fizzling(state: Res<CastingState>) -> bool {
+    matches!(
+        *state,
+        CastingState::Drawing { .. } | CastingState::Fizzling { .. }
+    )
 }
 
 /// Sends one tick of `PlayerInput` state to the server as an RPC, consuming one
@@ -519,11 +997,15 @@ fn send_input(
     mut commands: Commands,
     mut input: Single<&mut PlayerInput, With<LocalPlayer>>,
     mut tick: ResMut<ClientTick>,
+    casting: Res<CastingState>,
+    camera: Single<&Transform, With<Camera3d>>,
 ) {
     tick.0 = tick.0.wrapping_add(1);
 
     let cast = (!input.cast_queue.is_empty()).then(|| input.cast_queue.remove(0));
     let respawn = std::mem::take(&mut input.respawn);
+    let aiming = matches!(*casting, CastingState::Aiming);
+    let look_forward = camera.forward().as_vec3();
 
     commands.client_trigger(InputMessage {
         tick: tick.0,
@@ -531,6 +1013,8 @@ fn send_input(
         jump: input.jump,
         cast,
         respawn,
+        aiming,
+        look_forward,
     });
 }
 
@@ -615,17 +1099,26 @@ fn reconcile_local_player(
     history.entries.retain(|(t, _)| *t > acked_tick);
 }
 
+/// Updates the camera each frame: translation always tracks the player so the
+/// view doesn't lag behind the body, but rotation only consumes mouse motion
+/// when the player isn't drawing a spell. Without the always-on translation,
+/// freezing rotation during casting would also peg the camera to the
+/// pre-cast position and the player would visually "teleport" forward on
+/// release as the camera caught up.
 fn first_person_camera(
-    mut camera: Single<&mut Transform, With<Camera>>,
-    player: Single<&Transform, (With<LocalPlayer>, Without<Camera>)>,
+    mut camera: Single<&mut Transform, With<Camera3d>>,
+    player: Single<&Transform, (With<LocalPlayer>, Without<Camera3d>)>,
     mouse_motion: Res<AccumulatedMouseMotion>,
     settings: Res<CameraSettings>,
+    casting: Res<CastingState>,
 ) {
-    let (yaw, pitch, _) = camera.rotation.to_euler(EulerRot::YXZ);
-    let pitch = (pitch - mouse_motion.delta.y * settings.pitch_speed)
-        .clamp(settings.pitch_range.start, settings.pitch_range.end);
-    let yaw = yaw - mouse_motion.delta.x * settings.yaw_speed;
-    camera.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
+    if !matches!(*casting, CastingState::Drawing { .. }) {
+        let (yaw, pitch, _) = camera.rotation.to_euler(EulerRot::YXZ);
+        let pitch = (pitch - mouse_motion.delta.y * settings.pitch_speed)
+            .clamp(settings.pitch_range.start, settings.pitch_range.end);
+        let yaw = yaw - mouse_motion.delta.x * settings.yaw_speed;
+        camera.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
+    }
 
     let eye_offset = PLAYER_CYLINDER_HEIGHT / 2.0 + PLAYER_RADIUS - 0.1;
     camera.translation = player.translation + Vec3::Y * eye_offset;
