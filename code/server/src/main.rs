@@ -137,8 +137,10 @@ fn apply_input(
     if from.respawn {
         input.respawn = true;
     }
-    last_tick.0 = from.tick;
-    look.0 = from.look_forward;
+    // `set_if_neq` keeps replicon from re-replicating these every tick when
+    // the value hasn't moved (most notably `LookDirection` for an idle player).
+    last_tick.set_if_neq(LastProcessedInput(from.tick));
+    look.set_if_neq(LookDirection(from.look_forward));
 
     match (from.aiming, has_aiming) {
         (true, false) => {

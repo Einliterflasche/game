@@ -20,6 +20,10 @@ pub const PROTOCOL_ID: u64 = 0x5f00_7072_6a5f_6765; // arbitrary, shared server/
 pub const PLAYER_SPAWN: Vec3 = Vec3::new(0.0, 2.0, 0.0);
 pub const PLAYER_RADIUS: f32 = 0.25;
 pub const PLAYER_CYLINDER_HEIGHT: f32 = 1.0;
+/// Camera height above the player's center. The eye sits a hair below the
+/// top of the capsule so the camera doesn't poke out when standing under
+/// low geometry.
+pub const EYE_HEIGHT_OFFSET: f32 = PLAYER_CYLINDER_HEIGHT / 2.0 + PLAYER_RADIUS - 0.1;
 pub const WAND_TIP_OFFSET: Vec3 = Vec3::new(0.25, -0.15, -0.7);
 
 pub const SPELL_SPEED: f32 = 12.0;
@@ -56,7 +60,7 @@ pub struct PlayerOwner(pub u64);
 ///
 /// Replicated back to the owning client so reconciliation can match a server
 /// snapshot against the client's predicted-state history at the same tick.
-#[derive(Component, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastProcessedInput(pub u32);
 
 /// Marker for "this player has finished tracing a spell pattern and is in
@@ -73,7 +77,7 @@ pub struct Aiming;
 /// Tnua based on movement direction (not look direction), so it can't be
 /// reused for this — the camera pitch/yaw is per-client and only the owning
 /// client knows it. Updated by the server from each `InputMessage`.
-#[derive(Component, Clone, Copy, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LookDirection(pub Vec3);
 
 impl Default for LookDirection {

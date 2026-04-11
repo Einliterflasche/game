@@ -35,10 +35,10 @@ use bevy_replicon_renet::{
     renet::ConnectionConfig,
 };
 use shared::{
-    Aiming, DEFAULT_PORT, InputMessage, LastProcessedInput, LookDirection, PLAYER_CYLINDER_HEIGHT,
-    PLAYER_RADIUS, PROTOCOL_ID, PendingCast, Player, PlayerActionsConfig, PlayerInput, PlayerOwner,
-    PlayerPhysicsPlugin, SPELL_RADIUS, SharedReplicationPlugin, Spell, TnuaUserControlsSystems,
-    WAND_TIP_OFFSET, WORLD_CUBES, insert_player_sim_bundle,
+    Aiming, DEFAULT_PORT, EYE_HEIGHT_OFFSET, InputMessage, LastProcessedInput, LookDirection,
+    PLAYER_CYLINDER_HEIGHT, PLAYER_RADIUS, PROTOCOL_ID, PendingCast, Player, PlayerActionsConfig,
+    PlayerInput, PlayerOwner, PlayerPhysicsPlugin, SPELL_RADIUS, SharedReplicationPlugin, Spell,
+    TnuaUserControlsSystems, WAND_TIP_OFFSET, WORLD_CUBES, insert_player_sim_bundle,
 };
 
 // --- Types ---
@@ -121,6 +121,12 @@ const MIN_REACH_FRAC: f32 = 0.90;
 /// recorded sample before we append a new one. Keeps the buffer bounded when
 /// the player is mostly still.
 const SAMPLE_MIN_DIST_PX: f32 = 2.0;
+/// Hard cap on the trace buffer. `SAMPLE_MIN_DIST_PX` already throttles
+/// growth, but a player wiggling in tight loops can still grow it without
+/// bound — and `pattern_passes` is O(N) on the trace, so unbounded growth
+/// is also unbounded per-frame work. 2048 samples is ~5 m of cursor travel
+/// at 2 px/sample, far more than any plausible pattern.
+const TRACE_MAX_SAMPLES: usize = 2048;
 /// Duration of the red-flash fizzle animation on a failed cast.
 const FIZZLE_DURATION_SECS: f32 = 0.3;
 
@@ -215,7 +221,11 @@ struct PlayerVisualHandles {
 }
 
 /// Cached handles for the flame-orb visual. Same idea — one mesh + one material
-/// shared across every spell that gets replicated to this client.
+/// shared across every spell that gets replicated to this client. Lives as a
+/// `Resource` (not a `Local`) so all sites — `attach_spell_visuals`,
+/// `sync_preview_orb`, `sync_remote_preview_orbs` — share a single mesh and
+/// material in `Assets`, instead of each `Local<T: FromWorld>` minting its own.
+#[derive(Resource)]
 struct SpellVisualHandles {
     mesh: Handle<Mesh>,
     material: Handle<FlameOrbMaterial>,
@@ -262,6 +272,7 @@ fn main() {
         .init_resource::<ClientTick>()
         .init_resource::<CursorEngaged>()
         .init_resource::<CastingState>()
+        .init_resource::<SpellVisualHandles>()
         .add_systems(
             Startup,
             (
@@ -294,12 +305,19 @@ fn main() {
                     tick_fizzle,
                     update_crosshair_visibility,
                     sync_preview_orb,
-                    sync_remote_preview_orbs,
-                    update_gizmo_line_width,
                     draw_casting_overlay.run_if(is_drawing_or_fizzling),
                 )
                     .chain()
                     .after(cursor_toggle)
+                    .run_if(local_player_exists)
+                    .run_if(cursor_engaged),
+                // Other players' aim-phase preview orbs. Intentionally NOT
+                // gated on `cursor_engaged` or `local_player_exists` — remote
+                // players keep playing regardless of whether *this* client is
+                // paused, and pressing Esc on the viewer used to wrongly
+                // freeze every other player's orb.
+                sync_remote_preview_orbs,
+                update_gizmo_line_width
                     .run_if(local_player_exists)
                     .run_if(cursor_engaged),
             ),
@@ -474,14 +492,20 @@ fn setup_overlay_gizmos(mut store: ResMut<GizmoConfigStore>) {
 
 /// Keeps `GizmoConfig::line.width` in sync with the current window scale
 /// factor so the overlay reads as `OVERLAY_LINE_WIDTH_LOGICAL_PX` *logical*
-/// pixels regardless of display DPI. Cheap (one read + one multiply + one
-/// write per frame); runs unconditionally so the value is correct the first
-/// frame the player enters casting mode.
+/// pixels regardless of display DPI. Caches the last applied scale in a
+/// `Local` and early-returns when nothing changed — `scale_factor` only
+/// flips when the window moves between displays, so on every other frame
+/// this avoids touching `GizmoConfigStore` and tripping its change detection.
 fn update_gizmo_line_width(
     mut store: ResMut<GizmoConfigStore>,
     window: Single<&Window>,
+    mut last_scale: Local<f32>,
 ) {
     let scale = window.scale_factor().max(1.0);
+    if *last_scale == scale {
+        return;
+    }
+    *last_scale = scale;
     let (config, _) = store.config_mut::<DefaultGizmoConfigGroup>();
     config.line.width = OVERLAY_LINE_WIDTH_LOGICAL_PX * scale;
 }
@@ -601,7 +625,6 @@ fn spawn_crosshair(mut commands: Commands) {
                 top: Val::Px(-SIZE / 2.0),
                 ..default()
             },
-            // `BorderRadius::MAX` rounds the square node into a circle.
             border_radius: BorderRadius::MAX,
             ..default()
         },
@@ -617,10 +640,11 @@ fn update_crosshair_visibility(
     state: Res<CastingState>,
     mut crosshair: Single<&mut Visibility, With<Crosshair>>,
 ) {
-    **crosshair = match *state {
+    let wanted = match *state {
         CastingState::Idle | CastingState::Aiming => Visibility::Inherited,
         CastingState::Drawing { .. } | CastingState::Fizzling { .. } => Visibility::Hidden,
     };
+    crosshair.set_if_neq(wanted);
 }
 
 /// Reconciles a top-level `RemotePreviewOrb` for every aiming non-local
@@ -652,13 +676,9 @@ fn sync_remote_preview_orbs(
         (With<Player>, With<Aiming>, Without<LocalPlayer>),
     >,
     mut previews: Query<(Entity, &RemotePreviewOrb, &mut Transform), Without<Player>>,
-    handles: Local<SpellVisualHandles>,
+    handles: Res<SpellVisualHandles>,
     mut commands: Commands,
 ) {
-    // Eye height matches `first_person_camera`'s `eye_offset`. The camera
-    // sits a hair below the top of the capsule.
-    const EYE_HEIGHT_OFFSET: f32 = PLAYER_CYLINDER_HEIGHT / 2.0 + PLAYER_RADIUS - 0.1;
-
     let desired: HashMap<Entity, Vec3> = aiming_players
         .iter()
         .map(|(entity, player_xform, look)| {
@@ -706,11 +726,12 @@ fn sync_preview_orb(
     state: Res<CastingState>,
     existing: Query<Entity, With<PreviewOrb>>,
     camera: Single<Entity, With<Camera3d>>,
-    handles: Local<SpellVisualHandles>,
+    handles: Res<SpellVisualHandles>,
     mut commands: Commands,
 ) {
     let should_exist = matches!(*state, CastingState::Aiming);
-    match (should_exist, existing.iter().next()) {
+    let existing_orb = existing.iter().next();
+    match (should_exist, existing_orb) {
         (true, None) => {
             commands.entity(*camera).with_children(|parent| {
                 parent.spawn((
@@ -721,10 +742,8 @@ fn sync_preview_orb(
                 ));
             });
         }
-        (false, Some(_)) => {
-            for entity in &existing {
-                commands.entity(entity).despawn();
-            }
+        (false, Some(orb)) => {
+            commands.entity(orb).despawn();
         }
         _ => {}
     }
@@ -830,7 +849,6 @@ fn capture_casting_input(
     local_player: Single<Entity, With<LocalPlayer>>,
     spatial_query: SpatialQuery,
 ) {
-    // --- Aiming: release fires the spell, no other input matters ---
     if matches!(*state, CastingState::Aiming) {
         if mouse_buttons.just_released(MouseButton::Left) {
             let cast = build_cast(&camera, &spatial_query, *local_player);
@@ -840,7 +858,6 @@ fn capture_casting_input(
         return;
     }
 
-    // --- Click-down: enter Drawing if not already, then fall through ---
     if mouse_buttons.just_pressed(MouseButton::Left)
         && !matches!(*state, CastingState::Drawing { .. })
     {
@@ -854,23 +871,32 @@ fn capture_casting_input(
         return;
     };
 
-    // --- Drag: integrate cursor + sample ---
+    // Mouse delta is +y down (winit convention); Camera2d is +y up; negate.
     let scale = window.scale_factor().max(1.0);
     let delta = Vec2::new(mouse_motion.delta.x, -mouse_motion.delta.y) / scale;
     *cursor += delta;
     if let Some(last) = trace.last()
         && cursor.distance(*last) >= SAMPLE_MIN_DIST_PX
+        && trace.len() < TRACE_MAX_SAMPLES
     {
         trace.push(*cursor);
     }
 
-    // --- Pattern complete: arm the spell, hand off to the aim phase ---
     if pattern_passes(trace, window.height()) {
         *state = CastingState::Aiming;
+        // If LMB was already released this same frame (rare but possible —
+        // a fast flick can pass the pattern *and* release in one tick),
+        // fire immediately. Otherwise the next frame's `just_released` is
+        // false and we'd be stranded in `Aiming` until the player clicked
+        // again.
+        if mouse_buttons.just_released(MouseButton::Left) {
+            let cast = build_cast(&camera, &spatial_query, *local_player);
+            input.cast_queue.push(cast);
+            *state = CastingState::Idle;
+        }
         return;
     }
 
-    // --- Release without success: fizzle ---
     if mouse_buttons.just_released(MouseButton::Left) {
         let trace = std::mem::take(trace);
         *state = CastingState::Fizzling {
@@ -1120,8 +1146,7 @@ fn first_person_camera(
         camera.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
     }
 
-    let eye_offset = PLAYER_CYLINDER_HEIGHT / 2.0 + PLAYER_RADIUS - 0.1;
-    camera.translation = player.translation + Vec3::Y * eye_offset;
+    camera.translation = player.translation + Vec3::Y * EYE_HEIGHT_OFFSET;
 }
 
 /// Attaches the cached capsule mesh + material to any entity that gains the `Player`
@@ -1142,7 +1167,7 @@ fn attach_player_visuals(
 /// `Spell` component. Sharing handles avoids per-spell GPU resource allocation.
 fn attach_spell_visuals(
     insert: On<Insert, Spell>,
-    handles: Local<SpellVisualHandles>,
+    handles: Res<SpellVisualHandles>,
     mut commands: Commands,
 ) {
     commands.entity(insert.entity).insert((
