@@ -37,8 +37,9 @@ use bevy_replicon_renet::{
 use shared::{
     Aiming, DEFAULT_PORT, EYE_HEIGHT_OFFSET, InputMessage, LastProcessedInput, LookDirection,
     PLAYER_CYLINDER_HEIGHT, PLAYER_RADIUS, PROTOCOL_ID, PendingCast, Player, PlayerActionsConfig,
-    PlayerInput, PlayerOwner, PlayerPhysicsPlugin, SPELL_RADIUS, SharedReplicationPlugin, Spell,
-    TnuaUserControlsSystems, WAND_TIP_OFFSET, WORLD_CUBES, insert_player_sim_bundle,
+    PlayerInput, PlayerOwner, PlayerPhysicsPlugin, SharedReplicationPlugin, SpellKind, SpellOwner,
+    TnuaUserControlsSystems, WAND_TIP_OFFSET, WORLD_CUBES, compute_shield_transform,
+    insert_player_sim_bundle,
 };
 
 // --- Types ---
@@ -132,8 +133,8 @@ const FIZZLE_DURATION_SECS: f32 = 0.3;
 
 /// State machine for the spell-drawing gesture.
 ///
-/// Flow: `Idle` → (LMB down) `Drawing` → (pattern satisfied) `Aiming` →
-/// (LMB up) fire spell → `Idle`. Drawing → (LMB up without satisfying) →
+/// Flow: `Idle` → (LMB down) `Drawing` → (pattern matched) `Aiming(kind)` →
+/// (LMB up) fire spell → `Idle`. Drawing → (LMB up without matching) →
 /// `Fizzling` → (timer) `Idle`.
 ///
 /// `Idle`: nothing happening; single click no longer fires anything alone.
@@ -141,12 +142,13 @@ const FIZZLE_DURATION_SECS: f32 = 0.3;
 ///   and direction are **not** cached — they're recomputed at fire time so
 ///   the spell launches from the player's current position rather than from
 ///   wherever they clicked.
-/// `Aiming`: pattern was traced correctly and the player is still holding
-///   LMB. Camera rotation re-enables so the player can aim. The casting
-///   overlay is hidden and the regular crosshair returns. Releasing LMB
-///   fires the spell using the current camera transform; clicking again
-///   does nothing because LMB is already pressed.
-/// `Fizzling`: LMB released without satisfying the pattern. The trace fades
+/// `Aiming(kind)`: a pattern was matched and the player is still holding LMB.
+///   The matched `SpellKind` rides along so visuals (preview orb, eventually
+///   hint UI) can render the right spell. Camera rotation re-enables so the
+///   player can aim. The casting overlay is hidden and the regular crosshair
+///   returns. Releasing LMB fires the spell using the current camera
+///   transform; clicking again does nothing because LMB is already pressed.
+/// `Fizzling`: LMB released without satisfying any pattern. The trace fades
 ///   out red. Camera rotation is unlocked during fizzling.
 #[derive(Resource, Default)]
 enum CastingState {
@@ -158,7 +160,7 @@ enum CastingState {
         /// Sampled cursor positions, oldest first. Always starts with `Vec2::ZERO`.
         trace: Vec<Vec2>,
     },
-    Aiming,
+    Aiming(SpellKind),
     Fizzling {
         trace: Vec<Vec2>,
         timer: Timer,
@@ -185,12 +187,15 @@ struct NetworkOverlay;
 struct Crosshair;
 
 /// Marker for the local-only "armed spell" preview orb. Spawned as a child of
-/// the camera while `CastingState::Aiming` so it rides the camera transform
-/// exactly (same trick the wand cylinder uses). Despawned the moment the
-/// player leaves the aim phase — either by firing, fizzling, or pressing Esc.
-/// Not replicated: only the casting player should see their armed spell.
+/// the camera while `CastingState::Aiming(kind)` so it rides the camera
+/// transform exactly (same trick the wand cylinder uses). Despawned the moment
+/// the player leaves the aim phase — either by firing, fizzling, or pressing
+/// Esc. Stores the kind it was spawned for so `sync_preview_orb` can despawn
+/// and re-spawn with the right visual when the player switches spells
+/// mid-aim. Not replicated: only the casting player should see their armed
+/// spell.
 #[derive(Component)]
-struct PreviewOrb;
+struct PreviewOrb(SpellKind);
 
 /// Third-person preview orb for any non-local player who is currently in
 /// the aim phase. Spawned as a top-level entity by `sync_remote_preview_orbs`
@@ -211,6 +216,7 @@ struct PreviewOrb;
 #[derive(Component)]
 struct RemotePreviewOrb {
     player: Entity,
+    kind: SpellKind,
 }
 
 /// Cached handles for the player capsule visual. One mesh + one material shared
@@ -220,15 +226,36 @@ struct PlayerVisualHandles {
     material: Handle<StandardMaterial>,
 }
 
-/// Cached handles for the flame-orb visual. Same idea — one mesh + one material
-/// shared across every spell that gets replicated to this client. Lives as a
-/// `Resource` (not a `Local`) so all sites — `attach_spell_visuals`,
-/// `sync_preview_orb`, `sync_remote_preview_orbs` — share a single mesh and
-/// material in `Assets`, instead of each `Local<T: FromWorld>` minting its own.
+/// Per-kind cached mesh + material for every spell, keyed by `SpellKind`. Lives
+/// as a `Resource` so `attach_spell_visuals`, `sync_preview_orb`, and
+/// `sync_remote_preview_orbs` all share the same `Assets` handles instead of
+/// each minting their own. Adding a spell means adding an entry in
+/// `FromWorld` and a `MaterialPlugin` registration in `main`.
 #[derive(Resource)]
-struct SpellVisualHandles {
+struct SpellVisuals(HashMap<SpellKind, SpellVisual>);
+
+struct SpellVisual {
+    /// Mesh used when the spell is actually cast and replicated into the
+    /// world. For projectile spells this is small (e.g. a 0.1 m fire orb);
+    /// for the shield it's a unit-diameter sphere meant to be flattened by
+    /// `Transform::scale = shield::SIZE`.
     mesh: Handle<Mesh>,
-    material: Handle<FlameOrbMaterial>,
+    /// Mesh shown at the local player's wand tip during the aim phase
+    /// (and on remote players via `RemotePreviewOrb`). Decoupled from
+    /// `mesh` because in-world spell sizes don't all read well as a
+    /// camera-attached preview — the shield is body-sized in the world but
+    /// only needs a fingertip-sized blip while being aimed.
+    preview_mesh: Handle<Mesh>,
+    material: SpellMaterial,
+}
+
+/// Type-erased material handle. `MeshMaterial3d<M>` is generic over the
+/// material type, so we can't store mixed materials in a single handle. The
+/// enum lets `attach_spell_visuals` (and the preview-orb spawners) match on the
+/// concrete type and insert the right typed component.
+enum SpellMaterial {
+    FlameOrb(Handle<FlameOrbMaterial>),
+    Shield(Handle<ShieldMaterial>),
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
@@ -237,6 +264,12 @@ struct FlameOrbMaterial {
     core_color: LinearRgba,
     #[uniform(1)]
     flame_speed: f32,
+}
+
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+struct ShieldMaterial {
+    #[uniform(0)]
+    edge_color: LinearRgba,
 }
 
 // --- Impls & functions ---
@@ -259,6 +292,7 @@ fn main() {
                 },
             },
             MaterialPlugin::<FlameOrbMaterial>::default(),
+            MaterialPlugin::<ShieldMaterial>::default(),
             PlayerPhysicsPlugin,
         ))
         .insert_resource(GlobalAmbientLight::NONE)
@@ -272,7 +306,7 @@ fn main() {
         .init_resource::<ClientTick>()
         .init_resource::<CursorEngaged>()
         .init_resource::<CastingState>()
-        .init_resource::<SpellVisualHandles>()
+        .init_resource::<SpellVisuals>()
         .add_systems(
             Startup,
             (
@@ -300,6 +334,12 @@ fn main() {
                     // freeze during drawing is handled inside the function so
                     // the player doesn't get visually teleported on release.
                     first_person_camera,
+                    // Local-player shield prediction: re-anchors the local
+                    // shield to the predicted player + camera every frame so
+                    // it doesn't visibly trail by ~RTT behind the player's
+                    // own movement. Server replication still corrects each
+                    // tick, but this overwrites it before render.
+                    predict_local_shield,
                     capture_movement_input,
                     capture_casting_input,
                     tick_fizzle,
@@ -641,7 +681,7 @@ fn update_crosshair_visibility(
     mut crosshair: Single<&mut Visibility, With<Crosshair>>,
 ) {
     let wanted = match *state {
-        CastingState::Idle | CastingState::Aiming => Visibility::Inherited,
+        CastingState::Idle | CastingState::Aiming(_) => Visibility::Inherited,
         CastingState::Drawing { .. } | CastingState::Fizzling { .. } => Visibility::Hidden,
     };
     crosshair.set_if_neq(wanted);
@@ -672,80 +712,122 @@ fn update_crosshair_visibility(
 /// have one.
 fn sync_remote_preview_orbs(
     aiming_players: Query<
-        (Entity, &Transform, &LookDirection),
-        (With<Player>, With<Aiming>, Without<LocalPlayer>),
+        (Entity, &Transform, &LookDirection, &Aiming),
+        (With<Player>, Without<LocalPlayer>),
     >,
     mut previews: Query<(Entity, &RemotePreviewOrb, &mut Transform), Without<Player>>,
-    handles: Res<SpellVisualHandles>,
+    handles: Res<SpellVisuals>,
     mut commands: Commands,
 ) {
-    let desired: HashMap<Entity, Vec3> = aiming_players
+    struct DesiredPreview {
+        pos: Vec3,
+        kind: SpellKind,
+    }
+
+    let desired: HashMap<Entity, DesiredPreview> = aiming_players
         .iter()
-        .map(|(entity, player_xform, look)| {
+        .map(|(entity, player_xform, look, aiming)| {
             let camera_pos = player_xform.translation + Vec3::Y * EYE_HEIGHT_OFFSET;
             let camera_xform = Transform::from_translation(camera_pos)
                 .looking_to(look.0, Vec3::Y);
-            (entity, camera_xform.transform_point(WAND_TIP_OFFSET))
+            let pos = camera_xform.transform_point(WAND_TIP_OFFSET);
+            (entity, DesiredPreview { pos, kind: aiming.0 })
         })
         .collect();
 
+    // Existing previews: keep + reposition if the kind still matches; otherwise
+    // despawn (so the spawn pass below can rebuild with the right visual).
     let mut already_spawned = HashSet::new();
     for (orb_entity, orb_owner, mut orb_xform) in &mut previews {
-        if let Some(&pos) = desired.get(&orb_owner.player) {
-            orb_xform.translation = pos;
+        if let Some(d) = desired.get(&orb_owner.player)
+            && d.kind == orb_owner.kind
+        {
+            orb_xform.translation = d.pos;
             already_spawned.insert(orb_owner.player);
         } else {
             commands.entity(orb_entity).despawn();
         }
     }
 
-    for (player, &pos) in &desired {
+    for (player, d) in &desired {
         if already_spawned.contains(player) {
             continue;
         }
-        commands.spawn((
-            RemotePreviewOrb { player: *player },
-            Mesh3d(handles.mesh.clone()),
-            MeshMaterial3d(handles.material.clone()),
-            Transform::from_translation(pos),
+        let Some(visual) = handles.0.get(&d.kind) else {
+            continue;
+        };
+        let mut entity = commands.spawn((
+            RemotePreviewOrb {
+                player: *player,
+                kind: d.kind,
+            },
+            Mesh3d(visual.preview_mesh.clone()),
+            Transform::from_translation(d.pos),
         ));
+        match &visual.material {
+            SpellMaterial::FlameOrb(h) => {
+                entity.insert(MeshMaterial3d(h.clone()));
+            }
+            SpellMaterial::Shield(h) => {
+                entity.insert(MeshMaterial3d(h.clone()));
+            }
+        }
     }
 }
 
-/// Keeps a single `PreviewOrb` entity attached to the camera while the
-/// player is in `Aiming`, despawning it the moment the state changes. The
-/// orb is a child of the `Camera3d` entity, so its local
+/// Keeps a single `PreviewOrb` entity attached to the camera while the player
+/// is in `Aiming(kind)`, despawning it the moment the state changes. The orb
+/// is a child of the `Camera3d` entity, so its local
 /// `Transform::from_translation(WAND_TIP_OFFSET)` is automatically composed
-/// with the camera's global transform — the orb tracks every walk and
-/// camera turn for free, no per-frame position update needed.
+/// with the camera's global transform — the orb tracks every walk and camera
+/// turn for free, no per-frame position update needed.
 ///
-/// Reconcile-style: each frame compare desired vs. actual and add or remove
-/// as needed. Handles all four ways out of `Aiming` (fire, ESC reset,
-/// future fizzle path, anything else) without scattering despawn calls.
+/// Reconcile-style: each frame compare desired vs. actual and add, swap, or
+/// remove. The "swap" case (kind changed mid-aim) despawns and respawns so the
+/// new visual takes effect; in practice this only fires if patterns are
+/// chained, but it costs nothing in the steady state.
 fn sync_preview_orb(
     state: Res<CastingState>,
-    existing: Query<Entity, With<PreviewOrb>>,
+    existing: Query<(Entity, &PreviewOrb)>,
     camera: Single<Entity, With<Camera3d>>,
-    handles: Res<SpellVisualHandles>,
+    handles: Res<SpellVisuals>,
     mut commands: Commands,
 ) {
-    let should_exist = matches!(*state, CastingState::Aiming);
+    let wanted = match *state {
+        CastingState::Aiming(kind) => Some(kind),
+        _ => None,
+    };
     let existing_orb = existing.iter().next();
-    match (should_exist, existing_orb) {
-        (true, None) => {
+
+    match (wanted, existing_orb) {
+        (Some(kind), Some((_, preview))) if preview.0 == kind => {}
+        (Some(kind), existing) => {
+            if let Some((orb, _)) = existing {
+                commands.entity(orb).despawn();
+            }
+            let Some(visual) = handles.0.get(&kind) else {
+                return;
+            };
             commands.entity(*camera).with_children(|parent| {
-                parent.spawn((
-                    PreviewOrb,
-                    Mesh3d(handles.mesh.clone()),
-                    MeshMaterial3d(handles.material.clone()),
+                let mut child = parent.spawn((
+                    PreviewOrb(kind),
+                    Mesh3d(visual.preview_mesh.clone()),
                     Transform::from_translation(WAND_TIP_OFFSET),
                 ));
+                match &visual.material {
+                    SpellMaterial::FlameOrb(h) => {
+                        child.insert(MeshMaterial3d(h.clone()));
+                    }
+                    SpellMaterial::Shield(h) => {
+                        child.insert(MeshMaterial3d(h.clone()));
+                    }
+                }
             });
         }
-        (false, Some(orb)) => {
+        (None, Some((orb, _))) => {
             commands.entity(orb).despawn();
         }
-        _ => {}
+        (None, None) => {}
     }
 }
 
@@ -849,9 +931,9 @@ fn capture_casting_input(
     local_player: Single<Entity, With<LocalPlayer>>,
     spatial_query: SpatialQuery,
 ) {
-    if matches!(*state, CastingState::Aiming) {
+    if let CastingState::Aiming(kind) = *state {
         if mouse_buttons.just_released(MouseButton::Left) {
-            let cast = build_cast(&camera, &spatial_query, *local_player);
+            let cast = build_cast(kind, &camera, &spatial_query, *local_player);
             input.cast_queue.push(cast);
             *state = CastingState::Idle;
         }
@@ -882,15 +964,15 @@ fn capture_casting_input(
         trace.push(*cursor);
     }
 
-    if pattern_passes(trace, window.height()) {
-        *state = CastingState::Aiming;
+    if let Some(kind) = match_pattern(trace, window.height()) {
+        *state = CastingState::Aiming(kind);
         // If LMB was already released this same frame (rare but possible —
-        // a fast flick can pass the pattern *and* release in one tick),
+        // a fast flick can match the pattern *and* release in one tick),
         // fire immediately. Otherwise the next frame's `just_released` is
         // false and we'd be stranded in `Aiming` until the player clicked
         // again.
         if mouse_buttons.just_released(MouseButton::Left) {
-            let cast = build_cast(&camera, &spatial_query, *local_player);
+            let cast = build_cast(kind, &camera, &spatial_query, *local_player);
             input.cast_queue.push(cast);
             *state = CastingState::Idle;
         }
@@ -910,8 +992,14 @@ fn capture_casting_input(
 /// phase: at the moment the player releases LMB, we capture origin (current
 /// wand tip) and direction (camera-ray to the world point under the
 /// crosshair, with the local player's collider excluded so we don't hit our
-/// own capsule).
+/// own capsule). The `kind` rides along so the server's spawn dispatch
+/// knows which spell to build.
+///
+/// `direction` is computed unconditionally; non-projectile spells (e.g. the
+/// future shield) will simply ignore it on the server. Cheaper than branching
+/// here on every spell kind.
 fn build_cast(
+    kind: SpellKind,
     camera: &Transform,
     spatial_query: &SpatialQuery,
     local_player: Entity,
@@ -929,14 +1017,27 @@ fn build_cast(
         .map(|d| d.as_vec3())
         .unwrap_or(camera_fwd.as_vec3());
     PendingCast {
+        kind,
         origin: wand_tip,
         direction,
     }
 }
 
-/// Returns `true` when the trace satisfies the casting pattern (currently:
-/// vertical line drawn down from screen center). Free function so it can be
-/// called inline from the auto-fire branch without borrowing the `state`.
+/// Walks the pattern registry and returns the first matching `SpellKind`, or
+/// `None` if the trace matches no spell yet. Each spell owns its own
+/// recognizer; this function is just the dispatch table. New spells are added
+/// by appending an arm.
+fn match_pattern(trace: &[Vec2], window_height: f32) -> Option<SpellKind> {
+    if matches_fire_bolt(trace, window_height) {
+        return Some(SpellKind::FireBolt);
+    }
+    if matches_shield(trace, window_height) {
+        return Some(SpellKind::Shield);
+    }
+    None
+}
+
+/// Fire-bolt pattern: a vertical line drawn down from the screen center.
 ///
 /// Two checks:
 /// - Maximum lateral deviation must stay within tolerance. For a vertical
@@ -944,7 +1045,7 @@ fn build_cast(
 ///   `|p.x|`, so this is just the max absolute x across all samples.
 /// - The trace's lowest y must reach at least `MIN_REACH_FRAC * hint_len`
 ///   below the start. Catches "scribbled near the start without going down".
-fn pattern_passes(trace: &[Vec2], window_height: f32) -> bool {
+fn matches_fire_bolt(trace: &[Vec2], window_height: f32) -> bool {
     let hint_len = HINT_LEN_FRAC * window_height;
     let max_deviation = MAX_DEVIATION_FRAC * window_height;
     let min_reach_y = -MIN_REACH_FRAC * hint_len;
@@ -956,6 +1057,28 @@ fn pattern_passes(trace: &[Vec2], window_height: f32) -> bool {
     let min_y = trace.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
 
     max_lateral < max_deviation && min_y <= min_reach_y
+}
+
+/// Shield pattern: a horizontal line drawn from the screen center, in either
+/// direction. Mirror of the fire-bolt check with the axes swapped — vertical
+/// deviation is the lateral error, horizontal extent is the reach test.
+/// Direction-agnostic so the player can sweep left or right; both feel
+/// natural for a defensive cast.
+fn matches_shield(trace: &[Vec2], window_height: f32) -> bool {
+    let hint_len = HINT_LEN_FRAC * window_height;
+    let max_deviation = MAX_DEVIATION_FRAC * window_height;
+    let min_reach_x = MIN_REACH_FRAC * hint_len;
+
+    let max_lateral = trace
+        .iter()
+        .map(|p| p.y.abs())
+        .fold(0.0_f32, f32::max);
+    let max_reach_x = trace
+        .iter()
+        .map(|p| p.x.abs())
+        .fold(0.0_f32, f32::max);
+
+    max_lateral < max_deviation && max_reach_x >= min_reach_x
 }
 
 /// Advances the fizzle timer and returns to `Idle` once it's done. Runs every
@@ -984,7 +1107,7 @@ fn draw_casting_overlay(
     let end = Vec2::new(0.0, -hint_len);
 
     match &*state {
-        CastingState::Idle | CastingState::Aiming => {}
+        CastingState::Idle | CastingState::Aiming(_) => {}
         CastingState::Drawing { trace, .. } => {
             gizmos.line_2d(start, end, Color::srgba(1.0, 1.0, 1.0, 0.30));
             if trace.len() >= 2 {
@@ -1030,7 +1153,10 @@ fn send_input(
 
     let cast = (!input.cast_queue.is_empty()).then(|| input.cast_queue.remove(0));
     let respawn = std::mem::take(&mut input.respawn);
-    let aiming = matches!(*casting, CastingState::Aiming);
+    let aiming = match *casting {
+        CastingState::Aiming(kind) => Some(kind),
+        _ => None,
+    };
     let look_forward = camera.forward().as_vec3();
 
     commands.client_trigger(InputMessage {
@@ -1149,6 +1275,42 @@ fn first_person_camera(
     camera.translation = player.translation + Vec3::Y * EYE_HEIGHT_OFFSET;
 }
 
+/// Client-side prediction for the local player's shield. The server is
+/// authoritative — its `follow_shield` system runs every tick and replicates
+/// the shield's `Transform` — but at 64 Hz that's a ~RTT visual lag the
+/// player perceives as the shield "trailing" them as they move and turn.
+///
+/// Each frame we re-anchor any shield owned by the local client to the
+/// *predicted* local player position + the *current* camera forward, using
+/// the same `compute_shield_transform` helper the server uses. The next
+/// replicated transform overwrites this in PreUpdate, and we re-overwrite it
+/// here before the render — so the visible state is always the prediction.
+///
+/// Iterates only locally-owned shields (other players' shields keep their
+/// replicated transform; predicting them would require knowing the remote
+/// player's *current* look direction, which is itself only replicated).
+fn predict_local_shield(
+    local_player: Single<&Transform, With<LocalPlayer>>,
+    camera: Single<&Transform, (With<Camera3d>, Without<LocalPlayer>)>,
+    local_id: Res<LocalClientId>,
+    mut shields: Query<
+        (&SpellKind, &SpellOwner, &mut Transform),
+        (Without<LocalPlayer>, Without<Camera3d>),
+    >,
+) {
+    let player_translation = local_player.translation;
+    let camera_forward = camera.forward().as_vec3();
+    for (kind, owner, mut shield_xform) in &mut shields {
+        if !matches!(kind, SpellKind::Shield) {
+            continue;
+        }
+        if owner.0 != local_id.0 {
+            continue;
+        }
+        *shield_xform = compute_shield_transform(player_translation, camera_forward);
+    }
+}
+
 /// Attaches the cached capsule mesh + material to any entity that gains the `Player`
 /// component. Physics + `PlayerInput` are NOT inserted here — they're added only on
 /// the local player by `mark_local_player`, since remote players are pure visuals.
@@ -1163,17 +1325,33 @@ fn attach_player_visuals(
     ));
 }
 
-/// Attaches the cached flame-orb mesh + material to any entity that gains the
-/// `Spell` component. Sharing handles avoids per-spell GPU resource allocation.
+/// Attaches the cached mesh + material for the matching `SpellKind` to any
+/// replicated spell entity. Observes `Insert<SpellKind>` rather than a generic
+/// spell marker so the kind is guaranteed to be present at the moment we
+/// dispatch — replicon's apply order is per-component, and watching the kind
+/// directly avoids the "marker arrived but kind hasn't yet" race.
 fn attach_spell_visuals(
-    insert: On<Insert, Spell>,
-    handles: Res<SpellVisualHandles>,
+    insert: On<Insert, SpellKind>,
+    spells: Query<&SpellKind>,
+    handles: Res<SpellVisuals>,
     mut commands: Commands,
 ) {
-    commands.entity(insert.entity).insert((
-        Mesh3d(handles.mesh.clone()),
-        MeshMaterial3d(handles.material.clone()),
-    ));
+    let Ok(kind) = spells.get(insert.entity) else {
+        return;
+    };
+    let Some(visual) = handles.0.get(kind) else {
+        return;
+    };
+    let mut entity = commands.entity(insert.entity);
+    entity.insert(Mesh3d(visual.mesh.clone()));
+    match &visual.material {
+        SpellMaterial::FlameOrb(h) => {
+            entity.insert(MeshMaterial3d(h.clone()));
+        }
+        SpellMaterial::Shield(h) => {
+            entity.insert(MeshMaterial3d(h.clone()));
+        }
+    }
 }
 
 /// Marks the replicated Player entity whose `PlayerOwner` matches our own client id as the
@@ -1217,6 +1395,22 @@ impl Material for FlameOrbMaterial {
     }
 }
 
+impl Material for ShieldMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/shield.wgsl".into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        "shaders/shield.wgsl".into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        // Translucent fresnel shell — needs back-to-front blending so the
+        // shield reads as a soft volume rather than a hard masked surface.
+        AlphaMode::Blend
+    }
+}
+
 impl Default for CameraSettings {
     fn default() -> Self {
         let pitch_limit = FRAC_PI_2 - 0.01;
@@ -1241,17 +1435,60 @@ impl FromWorld for PlayerVisualHandles {
     }
 }
 
-impl FromWorld for SpellVisualHandles {
+impl FromWorld for SpellVisuals {
     fn from_world(world: &mut World) -> Self {
-        let mesh = world
+        let mut map = HashMap::new();
+
+        // Fire bolt: a small flame-orb sphere; the in-world cast and the
+        // wand-tip preview happen to be the same shape, so they share a
+        // single handle.
+        let fire_bolt_mesh = world
             .resource_mut::<Assets<Mesh>>()
-            .add(Sphere { radius: SPELL_RADIUS });
-        let material = world
+            .add(Sphere {
+                radius: shared::fire_bolt::RADIUS,
+            });
+        let fire_bolt_material = world
             .resource_mut::<Assets<FlameOrbMaterial>>()
             .add(FlameOrbMaterial {
                 core_color: LinearRgba::new(10.0, 6.0, 1.5, 1.0),
                 flame_speed: 1.0,
             });
-        Self { mesh, material }
+        map.insert(
+            SpellKind::FireBolt,
+            SpellVisual {
+                mesh: fire_bolt_mesh.clone(),
+                preview_mesh: fire_bolt_mesh,
+                material: SpellMaterial::FlameOrb(fire_bolt_material),
+            },
+        );
+
+        // Shield: unit-diameter sphere mesh — `Transform.scale = shield::SIZE`
+        // (set on the server) flattens it into the elliptic shield shape on
+        // the client without needing a custom mesh primitive. Radius 0.5 so
+        // the unit sphere matches Avian's `Collider::cuboid(1, 1, 1)` extent
+        // convention.
+        let shield_mesh = world
+            .resource_mut::<Assets<Mesh>>()
+            .add(Sphere { radius: 0.5 });
+        // Tiny separate sphere for the wand-tip preview — the in-world
+        // shield mesh is body-sized, way too big for a camera-attached hint.
+        let shield_preview_mesh = world
+            .resource_mut::<Assets<Mesh>>()
+            .add(Sphere { radius: 0.05 });
+        let shield_material = world
+            .resource_mut::<Assets<ShieldMaterial>>()
+            .add(ShieldMaterial {
+                edge_color: LinearRgba::new(0.4, 0.7, 1.6, 1.0),
+            });
+        map.insert(
+            SpellKind::Shield,
+            SpellVisual {
+                mesh: shield_mesh,
+                preview_mesh: shield_preview_mesh,
+                material: SpellMaterial::Shield(shield_material),
+            },
+        );
+
+        Self(map)
     }
 }

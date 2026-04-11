@@ -26,9 +26,35 @@ pub const PLAYER_CYLINDER_HEIGHT: f32 = 1.0;
 pub const EYE_HEIGHT_OFFSET: f32 = PLAYER_CYLINDER_HEIGHT / 2.0 + PLAYER_RADIUS - 0.1;
 pub const WAND_TIP_OFFSET: Vec3 = Vec3::new(0.25, -0.15, -0.7);
 
-pub const SPELL_SPEED: f32 = 12.0;
-pub const SPELL_LIFETIME: f32 = 3.0;
-pub const SPELL_RADIUS: f32 = 0.1;
+// Per-spell tuning lives in a module per spell. As spells diverge in shape and
+// behavior they need very different parameters, so a single shared `SpellConfig`
+// struct is the wrong abstraction — each module is the source of truth for its
+// own spell and is consumed directly where the values are needed.
+
+pub mod fire_bolt {
+    pub const LIFETIME_SECS: f32 = 3.0;
+    pub const SPEED: f32 = 12.0;
+    pub const RADIUS: f32 = 0.1;
+}
+
+pub mod shield {
+    use bevy::math::Vec3;
+
+    pub const LIFETIME_SECS: f32 = 1.0;
+    /// Distance from the caster's eye in the look direction.
+    pub const FORWARD_OFFSET: f32 = 0.7;
+    /// Vertical offset from the caster's eye in world space (negative = below
+    /// the eye), to put the shield at chest height.
+    pub const VERTICAL_OFFSET: f32 = -0.25;
+    /// Full-extent size of the shield, applied as `Transform::scale` so both
+    /// the visual sphere mesh (unit-diameter) and the unit-cuboid collider
+    /// end up at these dimensions. Z is the thin axis (faces along the
+    /// caster's look direction). Kept noticeably 3D rather than disc-flat:
+    /// a fully flat sphere would collapse all normal-transforms toward the
+    /// Z axis after the inverse-transpose pass, killing the fresnel rim
+    /// glow that gives the shield its visible silhouette.
+    pub const SIZE: Vec3 = Vec3::new(1.0, 0.8, 0.3);
+}
 
 /// Static level geometry: `(size, position)` for each reference cube.
 /// Duplicated on the client (with meshes) and server (colliders only).
@@ -46,9 +72,16 @@ pub const WORLD_CUBES: &[(f32, Vec3)] = &[
 #[derive(Component, Serialize, Deserialize)]
 pub struct Player;
 
-/// Marker for a flame-orb projectile. Replicated from server to all clients.
-#[derive(Component, Serialize, Deserialize)]
-pub struct Spell;
+/// Identifies which spell a given spell entity is. Replicated so the client
+/// can pick the correct mesh / material when the entity arrives, and the same
+/// component drives `cast_spell`'s spawn dispatch on the server. Acts as the
+/// spell-entity marker (no separate `Spell` marker needed) — per-kind tuning
+/// lives in the per-spell modules (`fire_bolt`, `shield`, …).
+#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum SpellKind {
+    FireBolt,
+    Shield,
+}
 
 /// Identifies the owning client of a `Player` entity via their replicon `NetworkId`
 /// (= the client's authentication id). Replicated so clients can figure out which
@@ -63,13 +96,16 @@ pub struct PlayerOwner(pub u64);
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastProcessedInput(pub u32);
 
-/// Marker for "this player has finished tracing a spell pattern and is in
-/// the aim phase, holding the cast ready to fire". Replicated to all clients
-/// so they can render a preview orb on the player and visually telegraph
-/// "this player is about to fire". The owning client also has its own
-/// camera-attached preview for the first-person view.
-#[derive(Component, Clone, Copy, Serialize, Deserialize)]
-pub struct Aiming;
+/// "This player has finished tracing a spell pattern and is holding the cast
+/// ready to fire". Carries the matched `SpellKind` so other clients can render
+/// a preview of the *correct* spell on the aiming player. The owning client
+/// also has its own camera-attached preview for the first-person view.
+///
+/// Replicated to all clients. Inserted/removed only on transitions, never
+/// mutated in place — `apply_input` swaps the component when the kind
+/// changes (rare in practice: a player can only be aiming one spell at a time).
+#[derive(Component, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Aiming(pub SpellKind);
 
 /// World-space camera-forward vector for a player. Replicated so other
 /// clients can position the aim-phase preview orb in front of them in the
@@ -95,6 +131,24 @@ pub struct SpellLifetime {
     pub timer: Timer,
 }
 
+/// Marks a spell that travels in a straight line and dies on contact with
+/// world geometry. Used to gate `despawn_expired_spells`'s contact-death rule
+/// — non-projectile spells (e.g. the future shield) keep their colliders for
+/// spell-vs-spell interaction but should not despawn just because they touch
+/// the floor or their caster.
+#[derive(Component)]
+pub struct Projectile;
+
+/// Back-reference from a spell entity to the player who cast it, identified
+/// by the caster's network ID (the same `u64` carried in `PlayerOwner`).
+///
+/// Replicated so the client can pick out "this is my shield" and run local
+/// prediction on it instead of waiting for the server's authoritative
+/// transform every tick. Server-side systems do `Entity` lookups by iterating
+/// players and matching `PlayerOwner.0` — fine at this scale.
+#[derive(Component, Clone, Copy, Serialize, Deserialize)]
+pub struct SpellOwner(pub u64);
+
 #[derive(TnuaScheme)]
 #[scheme(basis = TnuaBuiltinWalk)]
 pub enum PlayerActions {
@@ -118,8 +172,14 @@ pub struct PlayerInput {
     pub respawn: bool,
 }
 
+/// One queued cast captured on the client and applied on the server.
+///
+/// `direction` is meaningful for projectile spells (e.g. fire bolt). Spells
+/// that ignore direction (e.g. shield, heal) still set it — usually to the
+/// camera-forward — so the message stays the same shape regardless of kind.
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct PendingCast {
+    pub kind: SpellKind,
     pub origin: Vec3,
     pub direction: Vec3,
 }
@@ -143,10 +203,11 @@ pub struct InputMessage {
     pub jump: bool,
     pub cast: Option<PendingCast>,
     pub respawn: bool,
-    /// `true` while the client is in the aim phase (pattern traced, holding
-    /// LMB before release). The server toggles the `Aiming` marker on the
-    /// player entity based on this so other clients can see the preview orb.
-    pub aiming: bool,
+    /// `Some(kind)` while the client is in the aim phase (pattern traced,
+    /// holding LMB before release). The server reconciles the player's
+    /// `Aiming` component against this so other clients can render a preview
+    /// of the *correct* spell. `None` clears the aim state.
+    pub aiming: Option<SpellKind>,
     /// World-space camera-forward of the sending client. Server stores it
     /// on `LookDirection` so other clients can position the preview orb in
     /// front of the aiming player.
@@ -178,7 +239,8 @@ pub struct ServerSimPlugin;
 impl Plugin for SharedReplicationPlugin {
     fn build(&self, app: &mut App) {
         app.replicate::<Player>()
-            .replicate::<Spell>()
+            .replicate::<SpellKind>()
+            .replicate::<SpellOwner>()
             .replicate::<PlayerOwner>()
             .replicate::<LastProcessedInput>()
             .replicate::<Aiming>()
@@ -208,7 +270,7 @@ impl Plugin for ServerSimPlugin {
             FixedUpdate,
             (
                 respawn_player.before(TnuaUserControlsSystems),
-                (cast_spell, despawn_expired_spells)
+                (cast_spell, follow_shield, tick_spell_lifecycles)
                     .chain()
                     .after(TnuaUserControlsSystems),
             ),
@@ -325,41 +387,177 @@ fn player_controls(
     }
 }
 
-fn cast_spell(mut commands: Commands, mut players: Query<&mut PlayerInput, With<Player>>) {
-    for mut input in &mut players {
+fn cast_spell(
+    mut commands: Commands,
+    mut players: Query<(&PlayerOwner, &mut PlayerInput), With<Player>>,
+) {
+    for (owner, mut input) in &mut players {
         for cast in input.cast_queue.drain(..) {
+            spawn_spell(&mut commands, *owner, cast);
+        }
+    }
+}
+
+/// Server-side spawn dispatch. Each `SpellKind` arm builds the entity for that
+/// spell from the matching per-spell module's constants. New spells slot in as
+/// new arms.
+fn spawn_spell(commands: &mut Commands, caster: PlayerOwner, cast: PendingCast) {
+    match cast.kind {
+        SpellKind::FireBolt => {
             commands.spawn((
-                Spell,
+                cast.kind,
+                SpellOwner(caster.0),
+                Projectile,
                 SpellLifetime {
-                    timer: Timer::from_seconds(SPELL_LIFETIME, TimerMode::Once),
+                    timer: Timer::from_seconds(fire_bolt::LIFETIME_SECS, TimerMode::Once),
                 },
                 Replicated,
                 Transform::from_translation(cast.origin),
                 // Kinematic body: moved by its velocity each step, unaffected by forces
-                // or collisions. Spells are straight-line sensors, not physics projectiles.
+                // or collisions. Bolt spells are straight-line sensors, not physics projectiles.
                 RigidBody::Kinematic,
-                Collider::sphere(SPELL_RADIUS),
+                Collider::sphere(fire_bolt::RADIUS),
                 Sensor,
                 CollidingEntities::default(),
-                LinearVelocity(cast.direction * SPELL_SPEED),
+                LinearVelocity(cast.direction * fire_bolt::SPEED),
+            ));
+        }
+        SpellKind::Shield => {
+            // Initial transform is a placeholder — `follow_shield` overwrites
+            // it before the first physics step. The non-uniform `scale` is
+            // what gives the unit-cuboid collider AND the unit-sphere visual
+            // (on the client) their shield dimensions: Avian propagates
+            // `Transform.scale` to the collider via its `update_collider_scale`
+            // system, and Bevy's renderer uses the same scale on the mesh.
+            commands.spawn((
+                cast.kind,
+                SpellOwner(caster.0),
+                SpellLifetime {
+                    timer: Timer::from_seconds(shield::LIFETIME_SECS, TimerMode::Once),
+                },
+                Replicated,
+                Transform::from_translation(cast.origin).with_scale(shield::SIZE),
+                RigidBody::Kinematic,
+                Collider::cuboid(1.0, 1.0, 1.0),
+                Sensor,
+                CollidingEntities::default(),
             ));
         }
     }
 }
 
-fn despawn_expired_spells(
+/// Builds the shield transform (position + rotation + scale) from a caster's
+/// world-space body translation and look direction. Single source of truth so
+/// the server's `follow_shield` and the client's local-prediction system stay
+/// pixel-identical, otherwise the local shield would visibly snap each
+/// replication tick when the two formulas drift.
+pub fn compute_shield_transform(player_translation: Vec3, look: Vec3) -> Transform {
+    let eye_pos = player_translation + Vec3::Y * EYE_HEIGHT_OFFSET;
+    let eye_xform = Transform::from_translation(eye_pos).looking_to(look, Vec3::Y);
+    // Local offset: shield slightly below the eye line, in front of it.
+    // -Z is "forward" in Bevy camera convention so the negative Z reaches outward.
+    let local_offset = Vec3::new(0.0, shield::VERTICAL_OFFSET, -shield::FORWARD_OFFSET);
+    Transform {
+        translation: eye_xform.transform_point(local_offset),
+        rotation: eye_xform.rotation,
+        scale: shield::SIZE,
+    }
+}
+
+/// Reposes every active shield to ride its caster's "in front of the eyes"
+/// vector each tick. Shields are top-level entities (not children of the
+/// player) because the player's `Transform.rotation` is driven by Tnua to
+/// face the movement direction, which is unrelated to the camera-forward we
+/// want the shield to face — Tnua-rotated parents would point the shield
+/// sideways the moment the player strafed.
+///
+/// Caster lookup walks every player matching `SpellOwner.0 == PlayerOwner.0`.
+/// O(P × S) but P and S are tiny — not worth a HashMap.
+fn follow_shield(
+    casters: Query<(&PlayerOwner, &Transform, &LookDirection), (With<Player>, Without<SpellKind>)>,
+    mut shields: Query<(&SpellKind, &SpellOwner, &mut Transform), Without<Player>>,
+) {
+    for (kind, owner, mut shield_xform) in &mut shields {
+        if !matches!(kind, SpellKind::Shield) {
+            continue;
+        }
+        let Some((_, caster_xform, look)) =
+            casters.iter().find(|(po, _, _)| po.0 == owner.0)
+        else {
+            continue;
+        };
+        *shield_xform = compute_shield_transform(caster_xform.translation, look.0);
+    }
+}
+
+/// Per-tick spell entity housekeeping. Despawns each spell for one of three
+/// reasons, in priority order, with `continue` after the first hit so a single
+/// entity is never queued for despawn twice:
+///
+/// 1. **Lifetime expired** — the universal timer ran out.
+/// 2. **Blocked by another spell** — `despawns_on_spell_contact` says this
+///    spell dies when touching one of the kinds it's currently colliding
+///    with. Asymmetric, so `(FireBolt, Shield)` despawns the bolt while
+///    leaving the shield alive on the same contact.
+/// 3. **Projectile hit world** — projectile spells die on contact with
+///    anything that isn't a player and isn't another spell. Players pass
+///    through (no damage system yet); spells are governed by rule 2.
+///
+/// Combined into one system rather than split (timer / spell-vs-spell /
+/// world) so the `continue` chain serializes the despawn decisions and avoids
+/// the cross-system race where two systems each queue a despawn for the same
+/// entity in the same tick.
+fn tick_spell_lifecycles(
     mut commands: Commands,
-    mut spells: Query<(Entity, &mut SpellLifetime, &CollidingEntities)>,
+    mut spells: Query<(
+        Entity,
+        &SpellKind,
+        &mut SpellLifetime,
+        &CollidingEntities,
+        Has<Projectile>,
+    )>,
+    spell_kinds: Query<&SpellKind>,
     players: Query<(), With<Player>>,
     time: Res<Time>,
 ) {
-    for (entity, mut lifetime, colliding) in &mut spells {
+    for (entity, kind, mut lifetime, colliding, is_projectile) in &mut spells {
         lifetime.timer.tick(time.delta());
-        // Despawn if the spell touches anything that isn't a player. Spells pass
-        // through players for MVP (no damage implemented yet).
-        let hit_something = colliding.iter().any(|e| !players.contains(*e));
-        if lifetime.timer.is_finished() || hit_something {
+
+        if lifetime.timer.is_finished() {
             commands.entity(entity).despawn();
+            continue;
+        }
+
+        let blocked_by_spell = colliding.iter().any(|other| {
+            spell_kinds
+                .get(*other)
+                .map(|other_kind| despawns_on_spell_contact(*kind, *other_kind))
+                .unwrap_or(false)
+        });
+        if blocked_by_spell {
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        if is_projectile {
+            let hit_world = colliding
+                .iter()
+                .any(|e| !players.contains(*e) && !spell_kinds.contains(*e));
+            if hit_world {
+                commands.entity(entity).despawn();
+            }
         }
     }
+}
+
+/// Spell-vs-spell interaction table. Returns `true` when a spell of
+/// `self_kind` should despawn on contact with a spell of `other_kind`. The
+/// relation is intentionally asymmetric: the bolt dying against the shield
+/// leaves the shield alive, and a future shield-breaker would despawn the
+/// shield without itself dying.
+///
+/// New interactions are added as new arms in the `matches!`. The default
+/// (anything not listed) is "pass through, both unaffected".
+fn despawns_on_spell_contact(self_kind: SpellKind, other_kind: SpellKind) -> bool {
+    matches!((self_kind, other_kind), (SpellKind::FireBolt, SpellKind::Shield))
 }

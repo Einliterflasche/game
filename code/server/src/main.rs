@@ -109,24 +109,23 @@ fn spawn_player_on_connect(
 /// The sender's player character is the same entity as the sender's connection, so
 /// `FromClient::client_id` gives us the entity directly.
 ///
-/// Also reconciles the `Aiming` marker against the message's `aiming` flag —
-/// inserting/removing only on transition to avoid hammering replication every
-/// tick. Other clients see the marker pop on/off and react with their own
-/// preview-orb spawn/despawn logic.
+/// Also reconciles the `Aiming(SpellKind)` component against the message's
+/// `aiming` field. Only writes on transitions (insert / swap / remove) so
+/// replicon doesn't re-broadcast every tick of an unchanged aim.
 fn apply_input(
     from: On<FromClient<InputMessage>>,
     mut players: Query<(
         &mut PlayerInput,
         &mut LastProcessedInput,
         &mut LookDirection,
-        Has<Aiming>,
+        Option<&Aiming>,
     )>,
     mut commands: Commands,
 ) {
     let Some(entity) = from.client_id.entity() else {
         return;
     };
-    let Ok((mut input, mut last_tick, mut look, has_aiming)) = players.get_mut(entity) else {
+    let Ok((mut input, mut last_tick, mut look, current_aiming)) = players.get_mut(entity) else {
         return;
     };
     input.desired_motion = from.desired_motion;
@@ -142,13 +141,19 @@ fn apply_input(
     last_tick.set_if_neq(LastProcessedInput(from.tick));
     look.set_if_neq(LookDirection(from.look_forward));
 
-    match (from.aiming, has_aiming) {
-        (true, false) => {
-            commands.entity(entity).insert(Aiming);
+    // Promote/demote/swap the Aiming component when the desired kind diverges
+    // from the current one. The same arm handles "started aiming a different
+    // spell" by overwriting — `insert` replaces the existing component.
+    let desired = from.aiming.map(Aiming);
+    let current = current_aiming.copied();
+    if desired != current {
+        match desired {
+            Some(aiming) => {
+                commands.entity(entity).insert(aiming);
+            }
+            None => {
+                commands.entity(entity).remove::<Aiming>();
+            }
         }
-        (false, true) => {
-            commands.entity(entity).remove::<Aiming>();
-        }
-        _ => {}
     }
 }
