@@ -54,6 +54,12 @@ struct CameraSettings {
 #[derive(Resource, Clone, Copy)]
 struct LocalClientId(u64);
 
+/// Whether the game window currently owns the mouse. `false` at startup —
+/// the player must click to engage; ESC releases. Camera look + gameplay
+/// input are gated on this so the cursor can be moved freely while paused.
+#[derive(Resource, Default)]
+struct CursorEngaged(bool);
+
 /// Client-local monotonic tick counter, advanced once per FixedUpdate.
 ///
 /// Stamped onto every outgoing `InputMessage` so the server can echo it back
@@ -82,6 +88,12 @@ struct PredictedHistory {
 /// Max number of (tick, transform) entries kept on `PredictedHistory`.
 /// 256 ticks ≈ 2 s at 128 Hz — comfortably more than any plausible RTT.
 const PREDICTED_HISTORY_CAPACITY: usize = 256;
+
+/// Maximum distance the aim raycast travels from the camera looking for a
+/// target the crosshair is over. Past this we fall back to a virtual point
+/// at this distance along the camera ray. 100 m comfortably exceeds the spell
+/// reach (`SPELL_SPEED * SPELL_LIFETIME = 36 m`) so anything farther is moot.
+const AIM_RAY_MAX_DISTANCE: f32 = 100.0;
 
 /// Distance threshold (meters) above which a server snapshot is treated as a
 /// real mispredict and snapped to. Below this, the client keeps its prediction
@@ -149,9 +161,15 @@ fn main() {
         .insert_resource(Time::<Fixed>::from_hz(64.0))
         .init_resource::<CameraSettings>()
         .init_resource::<ClientTick>()
+        .init_resource::<CursorEngaged>()
         .add_systems(
             Startup,
-            (setup_world, setup_network, lock_cursor, spawn_network_overlay),
+            (
+                setup_world,
+                setup_network,
+                spawn_network_overlay,
+                spawn_crosshair,
+            ),
         )
         .add_systems(
             PreUpdate,
@@ -163,9 +181,12 @@ fn main() {
             Update,
             (
                 update_network_overlay,
+                cursor_toggle,
                 (first_person_camera, capture_input)
                     .chain()
-                    .run_if(local_player_exists),
+                    .after(cursor_toggle)
+                    .run_if(local_player_exists)
+                    .run_if(cursor_engaged),
             ),
         )
         .add_systems(
@@ -313,9 +334,33 @@ fn setup_network(mut commands: Commands, channels: Res<RepliconChannels>) {
     info!("connecting to {server_addr} as client id {client_id}");
 }
 
-fn lock_cursor(mut cursor: Single<&mut CursorOptions, With<Window>>) {
-    cursor.grab_mode = CursorGrabMode::Locked;
-    cursor.visible = false;
+/// Engages the cursor on a left click and releases it on Escape. Runs every
+/// frame regardless of player state — you should be able to free the mouse
+/// even before connecting. The engaging click is consumed via
+/// `clear_just_pressed` so the same press doesn't immediately fall through to
+/// `capture_input` and fire a spell.
+fn cursor_toggle(
+    mut engaged: ResMut<CursorEngaged>,
+    mut cursor: Single<&mut CursorOptions, With<Window>>,
+    mut mouse_buttons: ResMut<ButtonInput<MouseButton>>,
+    key_input: Res<ButtonInput<KeyCode>>,
+) {
+    if !engaged.0 {
+        if mouse_buttons.just_pressed(MouseButton::Left) {
+            engaged.0 = true;
+            cursor.grab_mode = CursorGrabMode::Locked;
+            cursor.visible = false;
+            mouse_buttons.clear_just_pressed(MouseButton::Left);
+        }
+    } else if key_input.just_pressed(KeyCode::Escape) {
+        engaged.0 = false;
+        cursor.grab_mode = CursorGrabMode::None;
+        cursor.visible = true;
+    }
+}
+
+fn cursor_engaged(engaged: Res<CursorEngaged>) -> bool {
+    engaged.0
 }
 
 /// Spawns a small absolute-positioned text node showing connection state and RTT.
@@ -341,6 +386,29 @@ fn spawn_network_overlay(mut commands: Commands) {
             width: Val::Px(280.0),
             ..default()
         },
+    ));
+}
+
+/// Spawns a tiny white square in the exact center of the screen — the GTA‑style
+/// "single point" crosshair. Centered via `50%` + a negative half-size margin so
+/// the dot's center, not its top-left, sits at the screen midpoint.
+fn spawn_crosshair(mut commands: Commands) {
+    const SIZE: f32 = 4.0;
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Percent(50.0),
+            top: Val::Percent(50.0),
+            width: Val::Px(SIZE),
+            height: Val::Px(SIZE),
+            margin: UiRect {
+                left: Val::Px(-SIZE / 2.0),
+                top: Val::Px(-SIZE / 2.0),
+                ..default()
+            },
+            ..default()
+        },
+        BackgroundColor(Color::WHITE),
     ));
 }
 
@@ -378,6 +446,8 @@ fn capture_input(
     key_input: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     camera: Single<&Transform, With<Camera>>,
+    local_player: Single<Entity, With<LocalPlayer>>,
+    spatial_query: SpatialQuery,
 ) {
     const BINDINGS: [(KeyCode, Vec3); 4] = [
         (KeyCode::KeyW, Vec3::Z),
@@ -396,23 +466,43 @@ fn capture_input(
     let forward = camera.forward().as_vec3();
     let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
     let right = Vec3::Y.cross(forward).normalize_or_zero();
-    let sprint = if key_input.pressed(KeyCode::ShiftLeft) {
-        3.0
-    } else {
+    // Default cadence is the brisk pace (was the old "sprint"); Shift slows
+    // down for sneaking. Tnua multiplies this against `walk.speed = 1.4` so
+    // 3.0 ≈ 4.2 m/s default and 1.0 ≈ 1.4 m/s while sneaking.
+    let speed_mult = if key_input.pressed(KeyCode::ShiftLeft) {
         1.0
+    } else {
+        3.0
     };
 
-    input.desired_motion = (forward * local.z + right * local.x) * sprint;
+    input.desired_motion = (forward * local.z + right * local.x) * speed_mult;
     input.jump = key_input.pressed(KeyCode::Space);
 
     if mouse_buttons.just_pressed(MouseButton::Left) {
+        // Aim ray from the camera (the crosshair is the camera ray, not the
+        // wand ray). Exclude the local player's own collider so we don't
+        // immediately hit the capsule we're standing inside.
+        let camera_pos = camera.translation;
+        let camera_fwd = camera.forward();
+        let filter = SpatialQueryFilter::from_excluded_entities([*local_player]);
+        let aim_distance = spatial_query
+            .cast_ray(camera_pos, camera_fwd, AIM_RAY_MAX_DISTANCE, true, &filter)
+            .map(|hit| hit.distance)
+            .unwrap_or(AIM_RAY_MAX_DISTANCE);
+        let target = camera_pos + camera_fwd * aim_distance;
+
+        // The spell still leaves the wand tip, but its direction now aims at
+        // the world point under the crosshair instead of being parallel to
+        // the camera forward (which had a 25 cm parallax offset).
+        let wand_tip = camera.transform_point(WAND_TIP_OFFSET);
+        let direction = Dir3::new(target - wand_tip)
+            .map(|d| d.as_vec3())
+            .unwrap_or(camera_fwd.as_vec3());
+
         input.cast_queue.push(PendingCast {
-            origin: camera.transform_point(WAND_TIP_OFFSET),
-            direction: camera.forward().as_vec3(),
+            origin: wand_tip,
+            direction,
         });
-    }
-    if key_input.just_pressed(KeyCode::Escape) {
-        input.respawn = true;
     }
 }
 
